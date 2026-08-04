@@ -1,7 +1,9 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from pathlib import Path
 
 from services.database import connect_db, close_db
 from routes.remove_bg import router as remove_bg_router
@@ -9,7 +11,8 @@ from routes.download   import router as download_router
 from routes.history    import router as history_router
 from routes.images     import router as images_router
 
-load_dotenv()
+# Load backend/.env (the file lives next to app.py)
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 
 @asynccontextmanager
@@ -27,10 +30,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow requests from the React frontend during development
+# Allow origins from env (comma-separated), fallback to Vite dev server
+_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+ALLOWED_ORIGINS = [o.strip() for o in _origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev server
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
