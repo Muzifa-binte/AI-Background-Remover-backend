@@ -5,7 +5,7 @@ Bridges the FastAPI route layer with the AI inference pipeline.
 """
 
 import asyncio
-from ai.inference import run_inference
+from inference import run_inference
 
 
 async def remove_background(input_path: str, output_path: str) -> None:
