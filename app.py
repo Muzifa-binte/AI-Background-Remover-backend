@@ -6,10 +6,14 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 from services.database import connect_db, close_db
-from routes.remove_bg import router as remove_bg_router
-from routes.download   import router as download_router
-from routes.history    import router as history_router
-from routes.images     import router as images_router
+from routes.remove_bg   import router as remove_bg_router
+from routes.download    import router as download_router
+from routes.history     import router as history_router
+from routes.images      import router as images_router
+from routes.enhance     import router as enhance_router
+from routes.replace_bg  import router as replace_bg_router
+from routes.smart_crop  import router as smart_crop_router
+from routes.batch       import router as batch_router
 
 # Load backend/.env (the file lives next to app.py)
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -45,10 +49,14 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Route registrations
 # ---------------------------------------------------------------------------
-app.include_router(remove_bg_router, prefix="/api")
-app.include_router(download_router,  prefix="/api")
-app.include_router(history_router,   prefix="/api")
-app.include_router(images_router,    prefix="/api")
+app.include_router(remove_bg_router,  prefix="/api")
+app.include_router(download_router,   prefix="/api")
+app.include_router(history_router,    prefix="/api")
+app.include_router(images_router,     prefix="/api")
+app.include_router(enhance_router,    prefix="/api")
+app.include_router(replace_bg_router, prefix="/api")
+app.include_router(smart_crop_router, prefix="/api")
+app.include_router(batch_router,      prefix="/api")
 
 
 @app.get("/", tags=["Health"])
