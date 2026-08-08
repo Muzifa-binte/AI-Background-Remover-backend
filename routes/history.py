@@ -1,20 +1,24 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List
 from services.database import get_collection
+from services.auth     import get_current_user
+from models.user       import UserOut
 
 router = APIRouter(tags=["History"])
 
 
 @router.get("/history", response_model=List[dict])
-async def get_history():
-    """
-    Returns the image processing history (most recent first, capped at 50).
-    """
+async def get_history(current_user: UserOut = Depends(get_current_user)):
+    """Returns the current user's bg-removal history (most recent first, capped at 50)."""
     try:
         collection = get_collection("history")
-        cursor = collection.find({}, {"_id": 0}).sort("created_at", -1).limit(50)
+        cursor  = (
+            collection
+            .find({"user_id": current_user.user_id}, {"_id": 0})
+            .sort("created_at", -1)
+            .limit(50)
+        )
         results = await cursor.to_list(length=50)
-        # Serialise datetime to ISO string
         for record in results:
             if "created_at" in record:
                 record["created_at"] = record["created_at"].isoformat()
