@@ -13,9 +13,20 @@ async def connect_db() -> None:
     """Open the MongoDB connection. Call from FastAPI startup event."""
     global client
     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    # If URI contains unencoded special chars in password, encode them
-    # Motor handles the full URI string directly
-    client = AsyncIOMotorClient(mongo_uri)
+    client = AsyncIOMotorClient(
+        mongo_uri,
+        serverSelectionTimeoutMS=5000,   # fail fast instead of hanging 30s
+        connectTimeoutMS=5000,
+        socketTimeoutMS=10000,
+    )
+    # Eagerly verify the connection so startup fails loudly if Atlas is down
+    try:
+        await client.admin.command("ping")
+        print("✅ MongoDB connected successfully.")
+    except Exception as exc:
+        print(f"⚠️  MongoDB connection failed: {exc}")
+        print("   Registration and login will not work until the database is reachable.")
+        print("   Check: Atlas IP whitelist, cluster is not paused, and network access.")
 
 
 def get_db_name() -> str:

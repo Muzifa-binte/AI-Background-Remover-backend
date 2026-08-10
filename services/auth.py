@@ -17,8 +17,8 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+import bcrypt as _bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from models.user import TokenData, UserOut
 from services.database import get_collection
@@ -31,16 +31,15 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return _bcrypt.hashpw(plain.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
