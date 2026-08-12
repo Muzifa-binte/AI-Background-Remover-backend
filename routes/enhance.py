@@ -6,6 +6,7 @@ import aiofiles
 from services.database    import get_collection
 from services.enhancement import enhance_image
 from services.auth        import get_current_user
+from services.quota       import check_and_increment_quota
 from services.storage     import save_file
 from models.user          import UserOut
 
@@ -32,6 +33,8 @@ async def enhance_endpoint(
     denoise_strength: int        = Form(9),
     current_user:     UserOut    = Depends(get_current_user),
 ):
+    await check_and_increment_quota(current_user.user_id)
+
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported file type. Use JPEG, PNG, or WebP.")
 
