@@ -1,6 +1,6 @@
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
+from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends
 from fastapi.responses import JSONResponse
-from services.bg_removal import remove_background
+from services.bg_removal import remove_background, QUALITY_OPTIONS
 from services.database   import get_collection
 from services.auth       import get_current_user
 from services.quota      import check_and_increment_quota
@@ -25,10 +25,23 @@ MAX_SIZE_MB   = 10
 @router.post("/remove-background")
 async def remove_bg_endpoint(
     file:         UploadFile = File(...),
+    quality:      str        = Form("fast"),
     current_user: UserOut    = Depends(get_current_user),
 ):
+    """
+    Remove the background from an uploaded image.
+
+    - **file**    JPEG, PNG, or WebP image (≤ 10 MB)
+    - **quality** `fast` (default) — U2Net, quick results
+                  `quality`        — BiRefNet, superior edge detail (hair, fur, complex subjects)
+    """
     await check_and_increment_quota(current_user.user_id)
 
+    if quality not in QUALITY_OPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"quality must be one of: {', '.join(QUALITY_OPTIONS)}.",
+        )
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported file type. Use JPEG, PNG, or WebP.")
 
@@ -46,7 +59,7 @@ async def remove_bg_endpoint(
     output_path     = os.path.join(OUTPUT_DIR, output_filename)
 
     try:
-        await remove_background(upload_path, output_path)
+        await remove_background(upload_path, output_path, quality=quality)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}")
 
@@ -60,6 +73,7 @@ async def remove_bg_endpoint(
             "original_name":   safe_name,
             "output_filename": output_filename,
             "download_url":    download_url,
+            "quality":         quality,
             "created_at":      datetime.now(timezone.utc),
         })
     except Exception:
@@ -68,4 +82,5 @@ async def remove_bg_endpoint(
     return JSONResponse({
         "output_filename": output_filename,
         "download_url":    download_url,
+        "quality":         quality,
     })
