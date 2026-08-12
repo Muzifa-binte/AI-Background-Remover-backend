@@ -3,7 +3,7 @@ Batch Processing Routes.
 
 POST /api/batch/start
 ─────────────────────
-Accepts up to 20 image files, saves them, creates a job record,
+Accepts up to 20 image files, saves them, creates a job record in MongoDB,
 fires a BackgroundTask to process them, and returns the job_id immediately.
 
 GET /api/batch/{job_id}/status
@@ -21,14 +21,17 @@ import os
 import uuid
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response, JSONResponse
 
+from models.user    import UserOut
+from services.auth  import get_current_user
+from services.quota import check_and_increment_quota
 from services.batch import create_job, get_job, process_batch, build_zip
 
 router = APIRouter(tags=["Batch Processing"])
 
-UPLOAD_DIR   = "uploads"
+UPLOAD_DIR    = "uploads"
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_SIZE_MB   = 10
 MAX_FILES     = 20
@@ -39,7 +42,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @router.post("/batch/start")
 async def batch_start(
     background_tasks: BackgroundTasks,
-    files: list[UploadFile] = File(...),
+    files:            list[UploadFile] = File(...),
+    current_user:     UserOut          = Depends(get_current_user),
 ):
     """
     Start a batch background-removal job.
@@ -56,6 +60,10 @@ async def batch_start(
             status_code=400,
             detail=f"Maximum {MAX_FILES} files per batch.",
         )
+
+    # Charge quota upfront for all files in the batch
+    for _ in files:
+        await check_and_increment_quota(current_user.user_id)
 
     file_entries: list[dict] = []
 
@@ -74,8 +82,8 @@ async def batch_start(
                 detail=f"File '{upload.filename}' exceeds {MAX_SIZE_MB} MB limit.",
             )
 
-        file_id    = str(uuid.uuid4())
-        safe_name  = os.path.basename(upload.filename or "upload")
+        file_id     = str(uuid.uuid4())
+        safe_name   = os.path.basename(upload.filename or "upload")
         upload_path = os.path.join(UPLOAD_DIR, f"{file_id}_{safe_name}")
 
         async with aiofiles.open(upload_path, "wb") as f:
@@ -86,7 +94,7 @@ async def batch_start(
             "upload_path":   upload_path,
         })
 
-    job_id = create_job(file_entries)
+    job_id = await create_job(file_entries, user_id=current_user.user_id)
 
     # Fire-and-forget: runs in FastAPI's thread pool
     background_tasks.add_task(process_batch, job_id)
@@ -99,18 +107,22 @@ async def batch_start(
 
 
 @router.get("/batch/{job_id}/status")
-async def batch_status(job_id: str):
+async def batch_status(
+    job_id:       str,
+    current_user: UserOut = Depends(get_current_user),
+):
     """
     Get the current status of a batch job.
 
     Returns per-file statuses and overall progress counts.
     Poll every 1–2 seconds while status is "pending" or "running".
+    Users can only access their own jobs.
     """
-    job = get_job(job_id)
+    job = await get_job(job_id, user_id=current_user.user_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
-    # Build a safe response — strip upload_path from client response
+    # Strip server-side paths from the client response
     files_out = [
         {
             "original_name":   entry["original_name"],
@@ -135,13 +147,17 @@ async def batch_status(job_id: str):
 
 
 @router.get("/batch/{job_id}/download")
-async def batch_download(job_id: str):
+async def batch_download(
+    job_id:       str,
+    current_user: UserOut = Depends(get_current_user),
+):
     """
     Download all successfully processed images as a ZIP archive.
 
     Only available once the job status is **"done"**.
+    Users can only download their own jobs.
     """
-    job = get_job(job_id)
+    job = await get_job(job_id, user_id=current_user.user_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
@@ -151,14 +167,12 @@ async def batch_download(job_id: str):
             detail=f"Job is still '{job['status']}'. Wait until status is 'done'.",
         )
 
-    result = build_zip(job_id)
-    if result is None or len(result[0]) == 0:
+    zip_bytes, zip_filename = build_zip(job)
+    if not zip_bytes:
         raise HTTPException(
             status_code=404,
             detail="No completed files available for download.",
         )
-
-    zip_bytes, zip_filename = result
 
     return Response(
         content=zip_bytes,

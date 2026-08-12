@@ -1,16 +1,8 @@
 """
 Batch Processing Service.
 
-Manages in-memory job state for batch background-removal jobs.
-Each job tracks per-file status so the frontend can poll for live progress.
-
-Design
-──────
-- Jobs are stored in a module-level dict (sufficient for single-process
-  deployments; swap for Redis if you later scale horizontally).
-- process_batch() is called from a FastAPI BackgroundTask — it runs the
-  existing run_inference() pipeline sequentially per file.
-- The zip download streams all completed output files on demand.
+Manages batch background-removal jobs, persisted to MongoDB so job state
+survives server restarts and horizontal scaling is possible.
 
 Job states
 ──────────
@@ -28,6 +20,7 @@ Per-file states
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import sys
@@ -43,6 +36,8 @@ if str(_AI_DIR) not in sys.path:
     sys.path.insert(0, str(_AI_DIR))
 
 from inference import run_inference  # noqa: E402
+
+from services.database import get_collection  # noqa: E402
 
 
 # ── Type definitions ───────────────────────────────────────────────────────
@@ -61,6 +56,7 @@ class FileEntry(TypedDict):
 
 class Job(TypedDict):
     job_id:     str
+    user_id:    str
     status:     JobStatus
     created_at: str
     files:      list[FileEntry]
@@ -69,22 +65,39 @@ class Job(TypedDict):
     failed:     int
 
 
-# ── In-memory store ────────────────────────────────────────────────────────
-
-_jobs: dict[str, Job] = {}
-
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+# ── Internal helpers ───────────────────────────────────────────────────────
+
+def _collection():
+    """Return the Motor collection for batch jobs."""
+    return get_collection("batch_jobs")
+
+
+async def _upsert_job(job: Job) -> None:
+    """Persist the full job document to MongoDB (upsert by job_id)."""
+    try:
+        col = _collection()
+        await col.replace_one(
+            {"job_id": job["job_id"]},
+            job,
+            upsert=True,
+        )
+    except Exception:
+        pass  # persistence failure should not crash the processing loop
+
+
 # ── Public helpers ─────────────────────────────────────────────────────────
 
-def create_job(file_entries: list[dict]) -> str:
+async def create_job(file_entries: list[dict], user_id: str) -> str:
     """
-    Register a new batch job and return its job_id.
+    Register a new batch job, persist it to MongoDB, and return its job_id.
 
     Args:
         file_entries: list of {"original_name": str, "upload_path": str}
+        user_id:      ID of the user who owns this job
     """
     job_id = str(uuid.uuid4())
     files: list[FileEntry] = [
@@ -97,8 +110,9 @@ def create_job(file_entries: list[dict]) -> str:
         }
         for e in file_entries
     ]
-    _jobs[job_id] = {
+    job: Job = {
         "job_id":     job_id,
+        "user_id":    user_id,
         "status":     "pending",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "files":      files,
@@ -106,61 +120,97 @@ def create_job(file_entries: list[dict]) -> str:
         "completed":  0,
         "failed":     0,
     }
+    await _upsert_job(job)
     return job_id
 
 
-def get_job(job_id: str) -> Job | None:
-    """Return the job state dict or None if not found."""
-    return _jobs.get(job_id)
+async def get_job(job_id: str, user_id: str | None = None) -> Job | None:
+    """
+    Retrieve job from MongoDB.
+
+    Args:
+        job_id:  The job identifier.
+        user_id: When provided, the job must belong to this user (authorization).
+
+    Returns:
+        Job dict or None if not found / not owned by user.
+    """
+    try:
+        query: dict = {"job_id": job_id}
+        if user_id:
+            query["user_id"] = user_id
+        col = _collection()
+        doc = await col.find_one(query, {"_id": 0})
+        return dict(doc) if doc else None  # type: ignore[arg-type]
+    except Exception:
+        return None
 
 
 def process_batch(job_id: str) -> None:
     """
-    Background task entry point.
+    Background task entry point. Runs in FastAPI's thread-pool executor.
 
-    Iterates over queued files, runs bg removal on each, and updates
-    per-file and overall job status in place.
-
-    This function is intentionally synchronous — it runs inside a
-    FastAPI BackgroundTask thread.
+    Iterates over queued files, runs bg removal on each, and persists
+    per-file and overall job status to MongoDB after every file.
     """
-    job = _jobs.get(job_id)
-    if job is None:
-        return
+    # We're in a sync thread — run async DB calls via a new event loop
+    loop = asyncio.new_event_loop()
 
-    job["status"] = "running"
+    try:
+        job = loop.run_until_complete(_fetch_job_sync(job_id))
+        if job is None:
+            return
 
-    for entry in job["files"]:
-        entry["status"] = "processing"
+        job["status"] = "running"
+        loop.run_until_complete(_upsert_job(job))
 
-        stem = Path(entry["upload_path"]).stem
-        output_filename = f"{stem}_result.png"
-        output_path     = os.path.join(OUTPUT_DIR, output_filename)
+        for entry in job["files"]:
+            entry["status"] = "processing"
+            loop.run_until_complete(_upsert_job(job))
 
-        try:
-            run_inference(entry["upload_path"], output_path)
-            entry["output_filename"] = output_filename
-            entry["status"]          = "done"
-            job["completed"]        += 1
-        except Exception as exc:
-            entry["status"] = "error"
-            entry["error"]  = str(exc)
-            job["failed"]  += 1
+            stem = Path(entry["upload_path"]).stem
+            output_filename = f"{stem}_result.png"
+            output_path     = os.path.join(OUTPUT_DIR, output_filename)
 
-    job["status"] = "done"
+            try:
+                run_inference(entry["upload_path"], output_path)
+                entry["output_filename"] = output_filename
+                entry["status"]          = "done"
+                job["completed"]        += 1
+            except Exception as exc:
+                entry["status"] = "error"
+                entry["error"]  = str(exc)
+                job["failed"]  += 1
+
+            loop.run_until_complete(_upsert_job(job))
+
+        job["status"] = "done"
+        loop.run_until_complete(_upsert_job(job))
+
+    finally:
+        loop.close()
 
 
-def build_zip(job_id: str) -> tuple[bytes, str] | None:
+async def _fetch_job_sync(job_id: str) -> Job | None:
+    """Fetch a job by ID without user check (internal use by process_batch)."""
+    try:
+        col = _collection()
+        doc = await col.find_one({"job_id": job_id}, {"_id": 0})
+        return dict(doc) if doc else None  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def build_zip(job: Job) -> tuple[bytes, str]:
     """
     Build an in-memory ZIP of all successfully processed output files.
 
-    Returns:
-        (zip_bytes, zip_filename) or None if job not found / no files done.
-    """
-    job = _jobs.get(job_id)
-    if job is None:
-        return None
+    Args:
+        job: The job dict (already retrieved from MongoDB).
 
+    Returns:
+        (zip_bytes, zip_filename)
+    """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for entry in job["files"]:
@@ -170,10 +220,5 @@ def build_zip(job_id: str) -> tuple[bytes, str] | None:
                     zf.write(file_path, arcname=entry["output_filename"])
 
     buf.seek(0)
-    zip_filename = f"batch_{job_id[:8]}_results.zip"
+    zip_filename = f"batch_{job['job_id'][:8]}_results.zip"
     return buf.read(), zip_filename
-
-
-def cleanup_job(job_id: str) -> None:
-    """Remove job from in-memory store (call after download if desired)."""
-    _jobs.pop(job_id, None)

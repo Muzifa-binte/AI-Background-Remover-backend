@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 from services.database import connect_db, close_db
+from services.quota    import setup_quota_indexes
+from services.cleanup  import start_cleanup_task, stop_cleanup_task
 from routes.auth        import router as auth_router
 from routes.remove_bg   import router as remove_bg_router
 from routes.download    import router as download_router
@@ -22,7 +24,10 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
+    await setup_quota_indexes()
+    start_cleanup_task()
     yield
+    stop_cleanup_task()
     await close_db()
 
 

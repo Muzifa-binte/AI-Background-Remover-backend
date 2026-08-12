@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from services.database    import get_collection
 from services.compositing import composite_background
 from services.auth        import get_current_user
+from services.quota       import check_and_increment_quota
 from services.storage     import save_file, get_download_url
 from models.user          import UserOut
 
@@ -35,6 +36,8 @@ async def replace_background_endpoint(
     bg_file:        UploadFile = File(None),
     current_user:   UserOut    = Depends(get_current_user),
 ):
+    await check_and_increment_quota(current_user.user_id)
+
     if bg_type not in ALLOWED_BG_MODES:
         raise HTTPException(status_code=400, detail=f"bg_type must be one of: {', '.join(sorted(ALLOWED_BG_MODES))}.")
     if gradient_dir not in ALLOWED_DIRECTIONS:

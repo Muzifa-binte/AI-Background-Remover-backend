@@ -4,9 +4,10 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
 from fastapi.responses import JSONResponse
 from services.database   import get_collection
-from services.bg_removal import remove_background
+from services.bg_removal import remove_background, QUALITY_OPTIONS
 from services.smart_crop import smart_crop, get_aspect_ratio_keys
 from services.auth       import get_current_user
+from services.quota      import check_and_increment_quota
 from services.storage    import save_file
 from models.user         import UserOut
 
@@ -27,8 +28,17 @@ async def smart_crop_endpoint(
     padding_pct:  float      = Form(0.05),
     aspect_ratio: str        = Form("free"),
     min_size:     int        = Form(64),
+    quality:      str        = Form("fast"),
     current_user: UserOut    = Depends(get_current_user),
 ):
+    """
+    Smart-crop an image around its subject.
+
+    - **quality** `fast` (U2Net) or `quality` (BiRefNet) — controls the
+      internal background-removal step used to detect the subject bbox.
+    """
+    await check_and_increment_quota(current_user.user_id)
+
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported file type. Use JPEG, PNG, or WebP.")
 
@@ -39,6 +49,8 @@ async def smart_crop_endpoint(
     valid_ratios = get_aspect_ratio_keys()
     if aspect_ratio not in valid_ratios:
         raise HTTPException(status_code=400, detail=f"Invalid aspect_ratio '{aspect_ratio}'. Choose from: {valid_ratios}")
+    if quality not in QUALITY_OPTIONS:
+        raise HTTPException(status_code=400, detail=f"quality must be one of: {', '.join(QUALITY_OPTIONS)}.")
 
     padding_pct = max(0.0, min(0.5, padding_pct))
     min_size    = max(16, min(2048, min_size))
@@ -52,7 +64,7 @@ async def smart_crop_endpoint(
     removed_filename = f"{upload_id}_removed.png"
     removed_path     = os.path.join(OUTPUT_DIR, removed_filename)
     try:
-        await remove_background(upload_path, removed_path)
+        await remove_background(upload_path, removed_path, quality=quality)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Background removal failed: {exc}")
 
@@ -82,7 +94,10 @@ async def smart_crop_endpoint(
             "upload_id": upload_id, "user_id": current_user.user_id,
             "original_name": safe_name,
             "removed_filename": removed_filename, "cropped_filename": cropped_filename,
-            "settings": {"padding_pct": padding_pct, "aspect_ratio": aspect_ratio, "min_size": min_size},
+            "settings": {
+                "padding_pct": padding_pct, "aspect_ratio": aspect_ratio,
+                "min_size": min_size, "quality": quality,
+            },
             "crop_meta": crop_meta, "created_at": datetime.now(timezone.utc),
         })
     except Exception:
