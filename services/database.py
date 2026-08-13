@@ -22,9 +22,9 @@ async def connect_db() -> None:
     # Eagerly verify the connection so startup fails loudly if Atlas is down
     try:
         await client.admin.command("ping")
-        print("✅ MongoDB connected successfully.")
+        print("[DATABASE] MongoDB connected successfully.")
     except Exception as exc:
-        print(f"⚠️  MongoDB connection failed: {exc}")
+        print(f"[DATABASE] MongoDB connection failed: {exc}")
         print("   Registration and login will not work until the database is reachable.")
         print("   Check: Atlas IP whitelist, cluster is not paused, and network access.")
 
