@@ -15,6 +15,8 @@ from routes.enhance     import router as enhance_router
 from routes.replace_bg  import router as replace_bg_router
 from routes.smart_crop  import router as smart_crop_router
 from routes.batch       import router as batch_router
+from routes.chat        import router as chat_router
+from routes.image       import router as image_router
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
@@ -53,6 +55,8 @@ app.include_router(enhance_router,    prefix="/api")
 app.include_router(replace_bg_router, prefix="/api")
 app.include_router(smart_crop_router, prefix="/api")
 app.include_router(batch_router,      prefix="/api")
+app.include_router(chat_router,       prefix="/api")
+app.include_router(image_router,      prefix="/api")
 
 
 @app.get("/", tags=["Health"])
