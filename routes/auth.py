@@ -18,7 +18,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Cookie, HTTPException, Response, status, Depends
 from pymongo.errors import ServerSelectionTimeoutError, NetworkTimeout, ConnectionFailure
 
-from models.user   import UserCreate, UserLogin, UserOut, TokenResponse
+from models.user   import (
+    UserCreate, UserLogin, UserOut, TokenResponse,
+    UpdateProfileRequest, UpdatePasswordRequest, DeleteAccountRequest,
+)
 from services.auth import (
     hash_password, verify_password,
     create_access_token, create_refresh_token, decode_token,
@@ -237,3 +240,130 @@ async def quota(current_user: UserOut = Depends(get_current_user)):
     - **disabled**  True when quota enforcement is turned off
     """
     return await get_quota_status(current_user.user_id)
+
+
+# ── Update Profile ──────────────────────────────────────────────────────
+
+@router.patch("/profile", response_model=UserOut)
+async def update_profile(
+    body: UpdateProfileRequest,
+    current_user: UserOut = Depends(get_current_user),
+):
+    """
+    Update the authenticated user's display name and/or email.
+
+    - **name**  (optional) New display name (2–80 chars)
+    - **email** (optional) New unique email address
+    """
+    collection = get_collection("users")
+
+    updates: dict = {}
+    if body.name is not None:
+        updates["name"] = body.name.strip()
+    if body.email is not None:
+        new_email = body.email.lower()
+        # Ensure the new email is not already taken by another account
+        existing = await collection.find_one(
+            {"email": new_email, "user_id": {"$ne": current_user.user_id}}
+        )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="That email address is already in use.",
+            )
+        updates["email"] = new_email
+
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide at least one field to update.",
+        )
+
+    await collection.update_one(
+        {"user_id": current_user.user_id},
+        {"$set": updates},
+    )
+
+    # Return fresh user doc
+    doc = await collection.find_one({"user_id": current_user.user_id}, {"_id": 0})
+    return UserOut(
+        user_id    = doc["user_id"],
+        name       = doc["name"],
+        email      = doc["email"],
+        created_at = doc["created_at"],
+    )
+
+
+# ── Change Password ──────────────────────────────────────────────────
+
+@router.patch("/password", status_code=204)
+async def change_password(
+    body: UpdatePasswordRequest,
+    current_user: UserOut = Depends(get_current_user),
+):
+    """
+    Change the authenticated user's password.
+
+    Verifies the current password before applying the change.
+
+    - **current_password** Existing password for verification
+    - **new_password**     New password (min 8 chars)
+    """
+    from services.auth import hash_password, verify_password  # local import avoids circular
+
+    collection = get_collection("users")
+    doc = await collection.find_one({"user_id": current_user.user_id})
+    if doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    if not verify_password(body.current_password, doc["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect.",
+        )
+
+    if body.current_password == body.new_password:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="New password must differ from the current password.",
+        )
+
+    new_hash = hash_password(body.new_password)
+    await collection.update_one(
+        {"user_id": current_user.user_id},
+        {"$set": {"hashed_password": new_hash}},
+    )
+    # 204 No Content — client should prompt user to re-login
+
+
+# ── Delete Account ─────────────────────────────────────────────────────
+
+@router.delete("/account", status_code=204)
+async def delete_account(
+    body: DeleteAccountRequest,
+    response: Response,
+    current_user: UserOut = Depends(get_current_user),
+):
+    """
+    Permanently delete the authenticated user's account.
+
+    Requires password confirmation. Clears the refresh cookie on success.
+
+    - **password** Current password for confirmation
+    """
+    from services.auth import verify_password  # local import avoids circular
+
+    collection = get_collection("users")
+    doc = await collection.find_one({"user_id": current_user.user_id})
+    if doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    if not verify_password(body.password, doc["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Password is incorrect. Account not deleted.",
+        )
+
+    await collection.delete_one({"user_id": current_user.user_id})
+    _clear_refresh_cookie(response)
+    # 204 No Content
