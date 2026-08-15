@@ -1,12 +1,15 @@
 """
 User Pydantic schemas.
 
-UserCreate   — payload for POST /api/auth/register
-UserLogin    — payload for POST /api/auth/login
-UserOut      — safe public representation (no password hash)
-UserInDB     — full internal representation (includes hashed_password)
-TokenResponse— JWT response body
-TokenData    — decoded JWT claims
+UserCreate          — payload for POST /api/auth/register
+UserLogin           — payload for POST /api/auth/login
+UserOut             — safe public representation (no password hash)
+UserInDB            — full internal representation (includes hashed_password)
+TokenResponse       — JWT response body
+TokenData           — decoded JWT claims
+UpdateProfileRequest— payload for PATCH /api/auth/profile
+UpdatePasswordRequest—payload for PATCH /api/auth/password
+DeleteAccountRequest— payload for DELETE /api/auth/account
 """
 
 from __future__ import annotations
@@ -46,3 +49,20 @@ class TokenResponse(BaseModel):
 class TokenData(BaseModel):
     user_id:  Optional[str] = None
     email:    Optional[str] = None
+
+
+class UpdateProfileRequest(BaseModel):
+    """Payload for PATCH /api/auth/profile — all fields optional."""
+    name:  Optional[str]      = Field(None, min_length=2, max_length=80)
+    email: Optional[EmailStr] = None
+
+
+class UpdatePasswordRequest(BaseModel):
+    """Payload for PATCH /api/auth/password."""
+    current_password: str = Field(..., min_length=1)
+    new_password:     str = Field(..., min_length=8, max_length=128)
+
+
+class DeleteAccountRequest(BaseModel):
+    """Payload for DELETE /api/auth/account — requires password confirmation."""
+    password: str = Field(..., min_length=1)
