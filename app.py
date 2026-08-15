@@ -5,9 +5,10 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from pathlib import Path
 
-from services.database import connect_db, close_db
-from services.quota    import setup_quota_indexes
-from services.cleanup  import start_cleanup_task, stop_cleanup_task
+from services.database   import connect_db, close_db
+from services.quota      import setup_quota_indexes
+from services.cleanup    import start_cleanup_task, stop_cleanup_task
+from services.bg_removal import warm_up
 from routes.auth        import router as auth_router
 from routes.remove_bg   import router as remove_bg_router
 from routes.download    import router as download_router
@@ -28,6 +29,8 @@ async def lifespan(app: FastAPI):
     await connect_db()
     await setup_quota_indexes()
     start_cleanup_task()
+    # Pre-load AI model sessions so the first request isn't slow
+    await warm_up()
     yield
     stop_cleanup_task()
     await close_db()
