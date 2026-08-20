@@ -5,15 +5,16 @@ import re
 import asyncio
 import logging
 from io import BytesIO
-from typing import Optional, Callable, Any
+from pathlib import Path
+from typing import Optional, Callable, Any, List, Dict, Tuple
 from PIL import Image
+from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Guard optional AI-provider packages so that a missing package for the
-# *unused* provider does not crash the backend at import time.
+# Guard optional AI-provider packages
 try:
     from openai import AsyncOpenAI
     _openai_available = True
@@ -35,13 +36,18 @@ class AIService:
     def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.is_configured = False
+        self.is_configured: bool = False
+        self.provider: str = "gemini"
+        self.api_key: str = ""
+        self.chat_model: str = "gemini-2.0-flash"
+        self.vision_model: str = "gemini-2.0-flash"
+        self.client: Optional[Any] = None
         self._setup_provider()
 
-    def _setup_provider(self):
+    def _setup_provider(self) -> None:
         self.provider = os.getenv("AI_PROVIDER", "gemini").lower()
         if self.provider == "groq":
-            if not _openai_available:
+            if not _openai_available or AsyncOpenAI is None:
                 raise ImportError(
                     "The 'openai' package is not installed for Groq support. Run: pip install openai"
                 )
@@ -59,7 +65,7 @@ class AIService:
         else:
             # Default to Gemini
             self.provider = "gemini"
-            if not _genai_available:
+            if not _genai_available or genai is None:
                 raise ImportError(
                     "The 'google-generativeai' package is not installed. Run: pip install google-generativeai"
                 )
@@ -71,9 +77,9 @@ class AIService:
             self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
             self.client = None
 
-    async def _retry_with_backoff(self, func: Callable, *args, **kwargs) -> Any:
+    async def _retry_with_backoff(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
         """Retry an async function with exponential backoff."""
-        last_exception = None
+        last_exception: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
                 return await func(*args, **kwargs)
@@ -94,14 +100,14 @@ class AIService:
                 else:
                     logger.error(f"All {self.max_retries} attempts failed for {func.__name__}: {str(e)}")
 
-        raise last_exception
+        if last_exception:
+            raise last_exception
+        raise RuntimeError(f"Function {func.__name__} failed without raising an exception.")
 
-    def _verify_configuration(self):
+    def _verify_configuration(self) -> None:
         """Verify AI configuration with helpful error messages."""
         if not self.is_configured:
             # Try to reload environment variables
-            from dotenv import load_dotenv
-            from pathlib import Path
             env_path = Path(__file__).resolve().parent.parent / ".env"
             load_dotenv(dotenv_path=env_path, override=True)
             self._setup_provider()
@@ -130,7 +136,7 @@ class AIService:
         text = re.sub(r'<think>.*', '', text, flags=re.DOTALL)
         return text.strip()
 
-    def _extract_json(self, text: str):
+    def _extract_json(self, text: str) -> Any:
         text = self._clean_text(text)
         try:
             return json.loads(text)
@@ -170,7 +176,7 @@ class AIService:
 
         raise ValueError(f"Could not parse valid JSON or list from AI response: {text}")
 
-    def _extract_thinking(self, text: str) -> tuple[str, str | None]:
+    def _extract_thinking(self, text: str) -> Tuple[str, Optional[str]]:
         match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
         if match:
             thinking = match.group(1).strip()
@@ -180,12 +186,14 @@ class AIService:
         reply = self._clean_text(text)
         return reply, thinking
 
-    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> tuple[str, str | None]:
+    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> Tuple[str, Optional[str]]:
         """Chat with AI assistant with retry logic and enhanced error handling."""
         self._verify_configuration()
 
-        async def _chat_impl():
+        async def _chat_impl() -> Tuple[str, Optional[str]]:
             if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
                 model = genai.GenerativeModel(self.chat_model)
                 if image_bytes:
                     img = Image.open(BytesIO(image_bytes)).convert("RGB")
@@ -201,7 +209,9 @@ class AIService:
                 raw_reply = response.text or "No response from AI."
                 return self._extract_thinking(raw_reply)
             else:
-                messages = [
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                messages: List[Dict[str, Any]] = [
                     {
                         "role": "system",
                         "content": (
@@ -249,11 +259,11 @@ class AIService:
             else:
                 raise RuntimeError(f"Unable to get AI response: {error_msg}. Please try again later.")
 
-    async def analyze_image(self, image_bytes: bytes) -> dict:
+    async def analyze_image(self, image_bytes: bytes) -> Dict[str, Any]:
         """Analyze image with retry logic and enhanced error handling."""
         self._verify_configuration()
 
-        async def _analyze_impl():
+        async def _analyze_impl() -> Dict[str, Any]:
             system_prompt = (
                 "You are an expert design AI. Analyze this image and extract composition details. "
                 "Respond ONLY with a valid JSON object matching the following structure:\n"
@@ -271,12 +281,16 @@ class AIService:
             )
 
             if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
                 model = genai.GenerativeModel(self.vision_model)
                 img = Image.open(BytesIO(image_bytes)).convert("RGB")
                 response = await model.generate_content_async([system_prompt, img])
                 raw_text = response.text or ""
                 return self._extract_json(raw_text)
             else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
                 base64_image = base64.b64encode(image_bytes).decode('utf-8')
                 image_url = f"data:image/jpeg;base64,{base64_image}"
 
@@ -329,7 +343,7 @@ class AIService:
         """Generate single caption with retry logic and enhanced error handling."""
         self._verify_configuration()
 
-        async def _caption_impl():
+        async def _caption_impl() -> str:
             style_guide = {
                 "instagram": "fun, engaging, casual with relevant popular emojis and potential hashtags.",
                 "professional": "polished, direct, respectful, suitable for LinkedIn or portfolio sites.",
@@ -342,12 +356,16 @@ class AIService:
             prompt = f"Write a single photo caption for this image in a {style.upper()} tone. Tone details: {tone} Respond ONLY with the caption text."
 
             if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
                 model = genai.GenerativeModel(self.vision_model)
                 img = Image.open(BytesIO(image_bytes)).convert("RGB")
                 response = await model.generate_content_async([prompt, img])
                 caption_text = response.text or ""
                 return self._clean_text(caption_text).strip().strip('"')
             else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
                 base64_image = base64.b64encode(image_bytes).decode('utf-8')
                 image_url = f"data:image/jpeg;base64,{base64_image}"
 
@@ -392,11 +410,11 @@ class AIService:
             else:
                 raise RuntimeError(f"Unable to generate caption: {error_msg}. Please try again later.")
 
-    async def generate_captions(self, image_bytes: bytes, style: str = "casual") -> list[str]:
+    async def generate_captions(self, image_bytes: bytes, style: str = "casual") -> List[str]:
         """Generate 3 unique captions with retry logic and enhanced error handling."""
         self._verify_configuration()
 
-        async def _captions_impl():
+        async def _captions_impl() -> List[str]:
             style_guide = {
                 "instagram": "fun, engaging, casual with relevant popular emojis and potential hashtags.",
                 "professional": "polished, direct, respectful, suitable for LinkedIn or portfolio sites.",
@@ -415,6 +433,8 @@ class AIService:
             )
 
             if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
                 model = genai.GenerativeModel(self.vision_model)
                 img = Image.open(BytesIO(image_bytes)).convert("RGB")
                 response = await model.generate_content_async([prompt, img])
@@ -424,6 +444,8 @@ class AIService:
                     return [str(c).strip().strip('"') for c in parsed[:3]]
                 return [self._clean_text(raw_text).strip().strip('"')]
             else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
                 base64_image = base64.b64encode(image_bytes).decode('utf-8')
                 image_url = f"data:image/jpeg;base64,{base64_image}"
                 response = await self.client.chat.completions.create(
@@ -464,11 +486,11 @@ class AIService:
             else:
                 raise RuntimeError(f"Unable to generate captions: {error_msg}. Please try again later.")
 
-    async def suggest_backgrounds(self, image_bytes: bytes) -> list[str]:
+    async def suggest_backgrounds(self, image_bytes: bytes) -> List[str]:
         """Suggest backgrounds with retry logic and enhanced error handling."""
         self._verify_configuration()
 
-        async def _suggestions_impl():
+        async def _suggestions_impl() -> List[str]:
             system_prompt = (
                 "You are a professional designer. Analyze the image and recommend 3 to 5 background placement ideas. "
                 "Your recommendations should suggest solid colors, scenes, or textures that will make the subject pop. "
@@ -477,12 +499,16 @@ class AIService:
             )
 
             if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
                 model = genai.GenerativeModel(self.vision_model)
                 img = Image.open(BytesIO(image_bytes))
                 response = await model.generate_content_async([system_prompt, img])
                 raw_text = response.text or ""
                 parsed = self._extract_json(raw_text)
             else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
                 base64_image = base64.b64encode(image_bytes).decode('utf-8')
                 image_url = f"data:image/jpeg;base64,{base64_image}"
 
