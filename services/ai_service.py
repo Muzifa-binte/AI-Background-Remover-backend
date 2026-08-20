@@ -180,7 +180,7 @@ class AIService:
         reply = self._clean_text(text)
         return reply, thinking
 
-    async def chat(self, message: str, image_bytes: bytes = None) -> tuple[str, str | None]:
+    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> tuple[str, str | None]:
         """Chat with AI assistant with retry logic and enhanced error handling."""
         self._verify_configuration()
 
