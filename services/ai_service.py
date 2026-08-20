@@ -39,8 +39,8 @@ class AIService:
         self.is_configured: bool = False
         self.provider: str = "gemini"
         self.api_key: str = ""
-        self.chat_model: str = "gemini-2.0-flash"
-        self.vision_model: str = "gemini-2.0-flash"
+        self.chat_model: str = "gemini-3.6-flash"
+        self.vision_model: str = "gemini-3.6-flash"
         self.client: Optional[Any] = None
         self._setup_provider()
 
@@ -73,8 +73,8 @@ class AIService:
             self.is_configured = bool(self.api_key and "your_gemini_api_key" not in self.api_key)
             if self.is_configured:
                 genai.configure(api_key=self.api_key)
-            self.chat_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
-            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
+            self.chat_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.6-flash")
+            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash")
             self.client = None
 
     async def _retry_with_backoff(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
