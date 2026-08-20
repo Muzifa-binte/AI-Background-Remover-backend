@@ -37,12 +37,12 @@ class AIService:
             self.is_configured = bool(self.api_key and "your_gemini_api_key" not in self.api_key)
             if self.is_configured:
                 genai.configure(api_key=self.api_key)
-            # Default to gemini-2.0-flash-lite (fast, cheap, multimodal).
+            # Default to gemini-3.5-flash-lite (fast, cheap, multimodal).
             # Override per-model via env vars if you want a different tier:
-            #   GEMINI_CHAT_MODEL   e.g. gemini-2.0-flash or gemini-1.5-pro
-            #   GEMINI_VISION_MODEL e.g. gemini-2.0-flash
-            self.chat_model   = os.getenv("GEMINI_CHAT_MODEL",   "gemini-2.0-flash-lite")
-            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash-lite")
+            #   GEMINI_CHAT_MODEL   e.g. gemini-3.5-flash or gemini-1.5-pro
+            #   GEMINI_VISION_MODEL e.g. gemini-3.5-flash
+            self.chat_model   = os.getenv("GEMINI_CHAT_MODEL",   "gemini-3.5-flash-lite")
+            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
             self.client = None
         else:
             if not _openai_available:

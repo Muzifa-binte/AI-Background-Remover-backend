@@ -91,4 +91,5 @@ async def remove_bg_endpoint(
         "output_filename": output_filename,
         "download_url":    download_url,
         "quality":         quality,
+
     })
