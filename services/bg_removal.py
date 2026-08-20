@@ -10,9 +10,15 @@ from pathlib import Path
 
 # Add the AI module directory to sys.path so that `inference`, `preprocessing`,
 # and `postprocessing` can be imported as top-level modules.
-_AI_DIR = Path(__file__).resolve().parents[2] / "AI-Background-Remover-AI"
-if str(_AI_DIR) not in sys.path:
-    sys.path.insert(0, str(_AI_DIR))
+for _candidate in [
+    Path(__file__).resolve().parents[2] / "AI",
+    Path(__file__).resolve().parents[2] / "AI-Background-Remover-AI",
+    Path(__file__).resolve().parents[1] / "AI",
+    Path(__file__).resolve().parents[1] / "AI-Background-Remover-AI",
+]:
+    if _candidate.exists() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+        break
 
 from inference import run_inference, run_inference_bytes, warm_up_models  # noqa: E402
 

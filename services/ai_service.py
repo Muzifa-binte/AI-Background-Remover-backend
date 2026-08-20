@@ -2,8 +2,25 @@ import os
 import base64
 import json
 import re
+import asyncio
+import logging
 from io import BytesIO
+from pathlib import Path
+from typing import Optional, Callable, Any, List, Dict, Tuple
 from PIL import Image
+from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Guard optional AI-provider packages
+try:
+    from openai import AsyncOpenAI
+    _openai_available = True
+except ImportError:
+    AsyncOpenAI = None  # type: ignore[assignment,misc]
+    _openai_available = False
 
 try:
     import google.generativeai as genai
@@ -12,31 +29,106 @@ except ImportError:
     genai = None  # type: ignore[assignment]
     _genai_available = False
 
+
 class AIService:
-    """Handles communication with the Gemini AI provider."""
+    """Handles communication with AI providers (Gemini or Groq) with enhanced error handling and retry logic."""
 
-    def __init__(self):
-        if not _genai_available:
-            raise ImportError(
-                "The 'google-generativeai' package is not installed. Run: pip install google-generativeai"
-            )
-        self.api_key = os.getenv("GEMINI_API_KEY", "")
-        self.is_configured = bool(self.api_key and "your_gemini_api_key" not in self.api_key)
-        if self.is_configured:
-            genai.configure(api_key=self.api_key)
-        
-        # Default to gemini-3.6-flash (fast, cheap, multimodal).
-        # Override per-model via env vars if you want a different tier (e.g. gemini-3.7-flash):
-        #   GEMINI_CHAT_MODEL
-        #   GEMINI_VISION_MODEL
-        self.chat_model   = os.getenv("GEMINI_CHAT_MODEL",   "gemini-3.6-flash")
-        self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash")
-        self.client = None
+    def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.is_configured: bool = False
+        self.provider: str = "gemini"
+        self.api_key: str = ""
+        self.chat_model: str = "gemini-2.0-flash"
+        self.vision_model: str = "gemini-2.0-flash"
+        self.client: Optional[Any] = None
+        self._setup_provider()
 
-    def _verify_configuration(self):
+    def _setup_provider(self) -> None:
+        self.provider = os.getenv("AI_PROVIDER", "gemini").lower()
+        if self.provider == "groq":
+            if not _openai_available or AsyncOpenAI is None:
+                raise ImportError(
+                    "The 'openai' package is not installed for Groq support. Run: pip install openai"
+                )
+            self.api_key = os.getenv("GROQ_API_KEY", "")
+            self.is_configured = bool(self.api_key and "your_groq_api_key" not in self.api_key)
+            self.chat_model = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
+            self.vision_model = os.getenv("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+            if self.is_configured:
+                self.client = AsyncOpenAI(
+                    base_url="https://api.groq.com/openai/v1",
+                    api_key=self.api_key,
+                )
+            else:
+                self.client = None
+        else:
+            # Default to Gemini
+            self.provider = "gemini"
+            if not _genai_available or genai is None:
+                raise ImportError(
+                    "The 'google-generativeai' package is not installed. Run: pip install google-generativeai"
+                )
+            self.api_key = os.getenv("GEMINI_API_KEY", "")
+            self.is_configured = bool(self.api_key and "your_gemini_api_key" not in self.api_key)
+            if self.is_configured:
+                genai.configure(api_key=self.api_key)
+            self.chat_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
+            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
+            self.client = None
+
+    async def _retry_with_backoff(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        """Retry an async function with exponential backoff."""
+        last_exception: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                error_type = type(e).__name__
+
+                # Don't retry on certain non-transient errors
+                if error_type in ['ValueError', 'ImportError']:
+                    logger.error(f"Non-retryable error in {func.__name__}: {str(e)}")
+                    raise
+
+                # Log retry attempt
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Attempt {attempt + 1}/{self.max_retries} failed for {func.__name__}: {str(e)}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"All {self.max_retries} attempts failed for {func.__name__}: {str(e)}")
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError(f"Function {func.__name__} failed without raising an exception.")
+
+    def _verify_configuration(self) -> None:
+        """Verify AI configuration with helpful error messages."""
         if not self.is_configured:
+            # Try to reload environment variables
+            env_path = Path(__file__).resolve().parent.parent / ".env"
+            load_dotenv(dotenv_path=env_path, override=True)
+            self._setup_provider()
+
+        # Final check with user-friendly error message
+        if not self.is_configured:
+            provider_name = "Groq" if self.provider == "groq" else "Gemini"
+            key_name = "GROQ_API_KEY" if self.provider == "groq" else "GEMINI_API_KEY"
+            placeholder = "your_groq_api_key_here" if self.provider == "groq" else "your_gemini_api_key_here"
+
+            # Check if placeholder key is still being used
+            if self.api_key and ("your_" in self.api_key.lower() or "placeholder" in self.api_key.lower()):
+                raise ValueError(
+                    f"{provider_name} API key is still set to a placeholder value. "
+                    f"Please replace '{placeholder}' with your actual API key in the .env file."
+                )
+
             raise ValueError(
-                "Gemini API Key is not configured. Please set a valid GEMINI_API_KEY in the .env file."
+                f"{provider_name} API key is not configured or invalid. "
+                f"Please set a valid {key_name} in the .env file. "
+                f"Make sure the .env file exists in the backend directory and contains your API key."
             )
 
     def _clean_text(self, text: str) -> str:
@@ -44,7 +136,7 @@ class AIService:
         text = re.sub(r'<think>.*', '', text, flags=re.DOTALL)
         return text.strip()
 
-    def _extract_json(self, text: str):
+    def _extract_json(self, text: str) -> Any:
         text = self._clean_text(text)
         try:
             return json.loads(text)
@@ -78,13 +170,13 @@ class AIService:
             cleaned_line = re.sub(r'^(?:\d+\.|\*|-)\s*', '', line).strip().strip('"').strip("'")
             if cleaned_line and len(cleaned_line) > 3 and not cleaned_line.startswith('<'):
                 fallback_list.append(cleaned_line)
-        
+
         if fallback_list:
             return fallback_list
 
         raise ValueError(f"Could not parse valid JSON or list from AI response: {text}")
 
-    def _extract_thinking(self, text: str) -> tuple[str, str | None]:
+    def _extract_thinking(self, text: str) -> Tuple[str, Optional[str]]:
         match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
         if match:
             thinking = match.group(1).strip()
@@ -94,29 +186,84 @@ class AIService:
         reply = self._clean_text(text)
         return reply, thinking
 
-    async def chat(self, message: str, image_bytes: bytes = None) -> tuple[str, str | None]:
+    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> Tuple[str, Optional[str]]:
+        """Chat with AI assistant with retry logic and enhanced error handling."""
         self._verify_configuration()
-        try:
-            model = genai.GenerativeModel(self.chat_model)
-            if image_bytes:
-                img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                prompt = (
-                    "You are a professional designer and helpful assistant for the AI Background Remover application. "
-                    "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions.\n\n"
-                    f"User Message: {message}"
-                )
-                response = await model.generate_content_async([prompt, img])
-            else:
-                response = await model.generate_content_async(message)
-            
-            raw_reply = response.text or "No response from AI."
-            return self._extract_thinking(raw_reply)
-        except Exception as e:
-            raise RuntimeError(f"Chat API error: {str(e)}")
 
-    async def analyze_image(self, image_bytes: bytes) -> dict:
-        self._verify_configuration()
+        async def _chat_impl() -> Tuple[str, Optional[str]]:
+            if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
+                model = genai.GenerativeModel(self.chat_model)
+                if image_bytes:
+                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                    prompt = (
+                        "You are a professional designer and helpful assistant for the AI Background Remover application. "
+                        "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions.\n\n"
+                        f"User Message: {message}"
+                    )
+                    response = await model.generate_content_async([prompt, img])
+                else:
+                    response = await model.generate_content_async(message)
+
+                raw_reply = response.text or "No response from AI."
+                return self._extract_thinking(raw_reply)
+            else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                messages: List[Dict[str, Any]] = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a professional designer and helpful assistant for the AI Background Remover application. "
+                            "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions."
+                        )
+                    }
+                ]
+                if image_bytes:
+                    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                    image_url = f"data:image/jpeg;base64,{base64_image}"
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": message},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    })
+                else:
+                    messages.append({"role": "user", "content": message})
+
+                response = await self.client.chat.completions.create(
+                    model=self.vision_model if image_bytes else self.chat_model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=1024
+                )
+                raw_reply = response.choices[0].message.content or "No response from AI."
+                return self._extract_thinking(raw_reply)
+
         try:
+            return await self._retry_with_backoff(_chat_impl)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Chat failed after retries: {error_msg}")
+
+            if "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+                raise RuntimeError("AI service authentication failed. Please check your API key configuration.")
+            elif "rate limit" in error_msg.lower():
+                raise RuntimeError("AI service rate limit exceeded. Please wait a moment and try again.")
+            elif "timeout" in error_msg.lower():
+                raise RuntimeError("AI service timed out. Please check your connection and try again.")
+            elif "quota" in error_msg.lower():
+                raise RuntimeError("AI service quota exceeded. Please check your plan and usage.")
+            else:
+                raise RuntimeError(f"Unable to get AI response: {error_msg}. Please try again later.")
+
+    async def analyze_image(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Analyze image with retry logic and enhanced error handling."""
+        self._verify_configuration()
+
+        async def _analyze_impl() -> Dict[str, Any]:
             system_prompt = (
                 "You are an expert design AI. Analyze this image and extract composition details. "
                 "Respond ONLY with a valid JSON object matching the following structure:\n"
@@ -133,17 +280,70 @@ class AIService:
                 '}'
             )
 
-            model = genai.GenerativeModel(self.vision_model)
-            img = Image.open(BytesIO(image_bytes)).convert("RGB")
-            response = await model.generate_content_async([system_prompt, img])
-            raw_text = response.text or ""
-            return self._extract_json(raw_text)
+            if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
+                model = genai.GenerativeModel(self.vision_model)
+                img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                response = await model.generate_content_async([system_prompt, img])
+                raw_text = response.text or ""
+                return self._extract_json(raw_text)
+            else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                image_url = f"data:image/jpeg;base64,{base64_image}"
+
+                prompt = (
+                    f"{system_prompt}\n"
+                    "Keep your thinking/reasoning process extremely brief (1-2 sentences), then output the JSON object. "
+                    "Respond ONLY with the JSON object."
+                )
+
+                response = await self.client.chat.completions.create(
+                    model=self.vision_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=1536
+                )
+                raw_text = response.choices[0].message.content or ""
+                return self._extract_json(raw_text)
+
+        try:
+            return await self._retry_with_backoff(_analyze_impl)
         except Exception as e:
-            raise RuntimeError(f"Vision API error (Image Analysis): {str(e)}")
+            error_msg = str(e)
+            logger.error(f"Image analysis failed after retries: {error_msg}")
+
+            if "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+                raise RuntimeError("AI service authentication failed during image analysis. Please check your API key configuration.")
+            elif "rate limit" in error_msg.lower():
+                raise RuntimeError("AI service rate limit exceeded during image analysis. Please wait a moment and try again.")
+            elif "timeout" in error_msg.lower():
+                raise RuntimeError("AI service timed out during image analysis. Please check your connection and try again.")
+            elif "quota" in error_msg.lower():
+                raise RuntimeError("AI service quota exceeded during image analysis. Please check your plan and usage.")
+            else:
+                raise RuntimeError(f"Unable to analyze image: {error_msg}. Please try again later.")
 
     async def generate_caption(self, image_bytes: bytes, style: str = "casual") -> str:
+        """Generate single caption with retry logic and enhanced error handling."""
         self._verify_configuration()
-        try:
+
+        async def _caption_impl() -> str:
             style_guide = {
                 "instagram": "fun, engaging, casual with relevant popular emojis and potential hashtags.",
                 "professional": "polished, direct, respectful, suitable for LinkedIn or portfolio sites.",
@@ -155,18 +355,66 @@ class AIService:
 
             prompt = f"Write a single photo caption for this image in a {style.upper()} tone. Tone details: {tone} Respond ONLY with the caption text."
 
-            model = genai.GenerativeModel(self.vision_model)
-            img = Image.open(BytesIO(image_bytes)).convert("RGB")
-            response = await model.generate_content_async([prompt, img])
-            caption_text = response.text or ""
-            return self._clean_text(caption_text).strip().strip('"')
-        except Exception as e:
-            raise RuntimeError(f"Vision API error (Caption): {str(e)}")
+            if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
+                model = genai.GenerativeModel(self.vision_model)
+                img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                response = await model.generate_content_async([prompt, img])
+                caption_text = response.text or ""
+                return self._clean_text(caption_text).strip().strip('"')
+            else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                image_url = f"data:image/jpeg;base64,{base64_image}"
 
-    async def generate_captions(self, image_bytes: bytes, style: str = "casual") -> list[str]:
-        """Generate 3 unique captions for the image in the requested style."""
-        self._verify_configuration()
+                prompt = f"Write a single photo caption for this image in a {style.upper()} tone. Tone details: {tone} Keep your thinking/reasoning process extremely brief (1-2 sentences), then output the caption text. Respond ONLY with the caption text."
+
+                response = await self.client.chat.completions.create(
+                    model=self.vision_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=1024
+                )
+                caption_text = response.choices[0].message.content or ""
+                return self._clean_text(caption_text).strip().strip('"')
+
         try:
+            return await self._retry_with_backoff(_caption_impl)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Caption generation failed after retries: {error_msg}")
+
+            if "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+                raise RuntimeError("AI service authentication failed during caption generation. Please check your API key configuration.")
+            elif "rate limit" in error_msg.lower():
+                raise RuntimeError("AI service rate limit exceeded during caption generation. Please wait a moment and try again.")
+            elif "timeout" in error_msg.lower():
+                raise RuntimeError("AI service timed out during caption generation. Please check your connection and try again.")
+            elif "quota" in error_msg.lower():
+                raise RuntimeError("AI service quota exceeded during caption generation. Please check your plan and usage.")
+            else:
+                raise RuntimeError(f"Unable to generate caption: {error_msg}. Please try again later.")
+
+    async def generate_captions(self, image_bytes: bytes, style: str = "casual") -> List[str]:
+        """Generate 3 unique captions with retry logic and enhanced error handling."""
+        self._verify_configuration()
+
+        async def _captions_impl() -> List[str]:
             style_guide = {
                 "instagram": "fun, engaging, casual with relevant popular emojis and potential hashtags.",
                 "professional": "polished, direct, respectful, suitable for LinkedIn or portfolio sites.",
@@ -184,20 +432,65 @@ class AIService:
                 'Example: ["Caption one here.", "Caption two here.", "Caption three here."]'
             )
 
-            model = genai.GenerativeModel(self.vision_model)
-            img = Image.open(BytesIO(image_bytes)).convert("RGB")
-            response = await model.generate_content_async([prompt, img])
-            raw_text = response.text or ""
-            parsed = self._extract_json(raw_text)
-            if isinstance(parsed, list):
-                return [str(c).strip().strip('"') for c in parsed[:3]]
-            return [self._clean_text(raw_text).strip().strip('"')]
-        except Exception as e:
-            raise RuntimeError(f"Vision API error (Captions): {str(e)}")
+            if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
+                model = genai.GenerativeModel(self.vision_model)
+                img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                response = await model.generate_content_async([prompt, img])
+                raw_text = response.text or ""
+                parsed = self._extract_json(raw_text)
+                if isinstance(parsed, list):
+                    return [str(c).strip().strip('"') for c in parsed[:3]]
+                return [self._clean_text(raw_text).strip().strip('"')]
+            else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                image_url = f"data:image/jpeg;base64,{base64_image}"
+                response = await self.client.chat.completions.create(
+                    model=self.vision_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": image_url}}
+                            ]
+                        }
+                    ],
+                    temperature=0.8,
+                    max_tokens=1024
+                )
+                raw_text = response.choices[0].message.content or ""
+                raw_text = self._clean_text(raw_text)
+                parsed = self._extract_json(raw_text)
+                if isinstance(parsed, list):
+                    return [str(c).strip().strip('"') for c in parsed[:3]]
+                return [raw_text.strip().strip('"')]
 
-    async def suggest_backgrounds(self, image_bytes: bytes) -> list[str]:
-        self._verify_configuration()
         try:
+            return await self._retry_with_backoff(_captions_impl)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Multiple captions generation failed after retries: {error_msg}")
+
+            if "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+                raise RuntimeError("AI service authentication failed during captions generation. Please check your API key configuration.")
+            elif "rate limit" in error_msg.lower():
+                raise RuntimeError("AI service rate limit exceeded during captions generation. Please wait a moment and try again.")
+            elif "timeout" in error_msg.lower():
+                raise RuntimeError("AI service timed out during captions generation. Please check your connection and try again.")
+            elif "quota" in error_msg.lower():
+                raise RuntimeError("AI service quota exceeded during captions generation. Please check your plan and usage.")
+            else:
+                raise RuntimeError(f"Unable to generate captions: {error_msg}. Please try again later.")
+
+    async def suggest_backgrounds(self, image_bytes: bytes) -> List[str]:
+        """Suggest backgrounds with retry logic and enhanced error handling."""
+        self._verify_configuration()
+
+        async def _suggestions_impl() -> List[str]:
             system_prompt = (
                 "You are a professional designer. Analyze the image and recommend 3 to 5 background placement ideas. "
                 "Your recommendations should suggest solid colors, scenes, or textures that will make the subject pop. "
@@ -205,12 +498,51 @@ class AIService:
                 'Example format: {"suggestions": ["Studio Soft Gray", "Sunlit Minimalist Office", "Vibrant Cyberpunk Streets"]}'
             )
 
-            model = genai.GenerativeModel(self.vision_model)
-            img = Image.open(BytesIO(image_bytes))
-            response = await model.generate_content_async([system_prompt, img])
-            raw_text = response.text or ""
-            parsed = self._extract_json(raw_text)
-            
+            if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
+                model = genai.GenerativeModel(self.vision_model)
+                img = Image.open(BytesIO(image_bytes))
+                response = await model.generate_content_async([system_prompt, img])
+                raw_text = response.text or ""
+                parsed = self._extract_json(raw_text)
+            else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                image_url = f"data:image/jpeg;base64,{base64_image}"
+
+                prompt = (
+                    "You are a professional designer. Analyze the image and recommend 3 to 5 background placement ideas. "
+                    "Your recommendations should suggest solid colors, scenes, or textures that will make the subject pop. "
+                    "Keep your thinking/reasoning process extremely brief (1-2 sentences), then output the JSON object. "
+                    "Respond ONLY with a valid JSON object containing the key 'suggestions' pointing to a list of strings.\n"
+                    'Example format: {"suggestions": ["Studio Soft Gray", "Sunlit Minimalist Office", "Vibrant Cyberpunk Streets"]}'
+                )
+
+                response = await self.client.chat.completions.create(
+                    model=self.vision_model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Suggest backgrounds for this image as a JSON object with key 'suggestions'."},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=1536
+                )
+                raw_text = response.choices[0].message.content or ""
+                parsed = self._extract_json(raw_text)
+
             if isinstance(parsed, list):
                 return [str(item) for item in parsed]
             elif isinstance(parsed, dict):
@@ -220,8 +552,22 @@ class AIService:
                 for val in parsed.values():
                     if isinstance(val, list):
                         return [str(item) for item in val]
-            
-            raise ValueError(f"Could not extract background list from parsed JSON: {parsed}")
-        except Exception as e:
-            raise RuntimeError(f"Vision API error (Suggestions): {str(e)}")
 
+            raise ValueError(f"Could not extract background list from parsed JSON: {parsed}")
+
+        try:
+            return await self._retry_with_backoff(_suggestions_impl)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Background suggestions failed after retries: {error_msg}")
+
+            if "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+                raise RuntimeError("AI service authentication failed during background suggestions. Please check your API key configuration.")
+            elif "rate limit" in error_msg.lower():
+                raise RuntimeError("AI service rate limit exceeded during background suggestions. Please wait a moment and try again.")
+            elif "timeout" in error_msg.lower():
+                raise RuntimeError("AI service timed out during background suggestions. Please check your connection and try again.")
+            elif "quota" in error_msg.lower():
+                raise RuntimeError("AI service quota exceeded during background suggestions. Please check your plan and usage.")
+            else:
+                raise RuntimeError(f"Unable to generate background suggestions: {error_msg}. Please try again later.")
