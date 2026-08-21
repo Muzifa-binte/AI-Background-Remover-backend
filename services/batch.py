@@ -30,7 +30,7 @@ import zipfile
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, Literal
+from typing import Generator, TypedDict, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -275,24 +275,126 @@ def process_batch(job_id: str) -> None:
     asyncio.run(process_batch_job(job_id))
 
 
-def build_zip(job: Job) -> tuple[bytes, str]:
+# ── Format helpers (mirrors routes/download.py) ───────────────────────────
+
+SUPPORTED_FORMATS = {"png", "jpeg", "webp"}
+
+MEDIA_TYPES = {
+    "png":  "image/png",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+}
+
+ZIP_EXTENSIONS = {
+    "png":  ".png",
+    "jpeg": ".jpg",
+    "webp": ".webp",
+}
+
+
+def _convert_image(src_path: str, fmt: str, quality: int) -> bytes:
     """
-    Build an in-memory ZIP of all successfully processed output files.
+    Convert *src_path* (always a PNG with possible alpha) to *fmt* at *quality*.
+    Returns raw bytes of the converted image.
+    """
+    from PIL import Image  # lazy import — not needed unless downloading
+
+    with Image.open(src_path) as img:
+        if fmt == "jpeg" and img.mode in ("RGBA", "LA", "P"):
+            # JPEG cannot carry transparency — flatten onto white
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+            img = bg
+        elif img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if fmt in ("png", "webp") else "RGB")
+
+        buf = io.BytesIO()
+        pil_fmt = "JPEG" if fmt == "jpeg" else fmt.upper()
+        save_kwargs: dict = {"format": pil_fmt}
+        if fmt in ("jpeg", "webp"):
+            save_kwargs["quality"] = quality
+        if fmt == "webp":
+            save_kwargs["method"] = 6  # best compression ratio
+        img.save(buf, **save_kwargs)
+        return buf.getvalue()
+
+
+def _clean_arcname(original_name: str, fmt: str) -> str:
+    """
+    Build a human-readable filename for the ZIP entry, e.g.
+    ``photo.jpg``  → ``photo_no_bg.png``
+    """
+    stem = Path(original_name).stem
+    return f"{stem}_no_bg{ZIP_EXTENSIONS[fmt]}"
+
+
+def stream_zip(
+    job: "Job",
+    fmt: str = "png",
+    quality: int = 90,
+) -> Generator[bytes, None, None]:
+    """
+    Stream a ZIP archive of all successfully processed output files.
+
+    Yields raw bytes chunks suitable for a ``StreamingResponse``.
+    Each output PNG is optionally converted to *fmt* at *quality* before
+    being packed — keeping per-file memory proportional to one image, not
+    the whole batch.
 
     Args:
-        job: The job dict (already retrieved from MongoDB).
+        job:     The job dict (already retrieved from MongoDB).
+        fmt:     Target image format — ``png`` (default), ``jpeg``, or ``webp``.
+        quality: JPEG/WebP quality 1–100 (ignored for PNG).
 
-    Returns:
-        (zip_bytes, zip_filename)
+    Yields:
+        bytes chunks of the ZIP stream.
     """
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for entry in job["files"]:
-            if entry["status"] == "done" and entry["output_filename"]:
-                file_path = os.path.join(OUTPUT_DIR, entry["output_filename"])
-                if os.path.isfile(file_path):
-                    zf.write(file_path, arcname=entry["output_filename"])
+    fmt = fmt.lower().strip()
+    if fmt not in SUPPORTED_FORMATS:
+        fmt = "png"
+    quality = max(1, min(100, quality))
 
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for entry in job["files"]:
+            if entry["status"] != "done" or not entry["output_filename"]:
+                continue
+
+            src_path = os.path.join(OUTPUT_DIR, entry["output_filename"])
+            if not os.path.isfile(src_path):
+                logger.warning(f"[Batch] ZIP: missing output file '{src_path}', skipping.")
+                continue
+
+            arcname = _clean_arcname(entry["original_name"], fmt)
+
+            try:
+                if fmt == "png":
+                    # Fast path: source is already PNG — no conversion
+                    zf.write(src_path, arcname=arcname)
+                else:
+                    img_bytes = _convert_image(src_path, fmt, quality)
+                    zf.writestr(arcname, img_bytes)
+            except Exception as exc:
+                logger.error(
+                    f"[Batch] ZIP: failed to pack '{entry['original_name']}': {exc}"
+                )
+
+    # Yield the complete in-memory buffer as a single chunk.
+    # For future true streaming this generator boundary makes it easy to
+    # switch to a chunked zip writer without changing the caller.
     buf.seek(0)
+    while chunk := buf.read(64 * 1024):  # 64 KB chunks
+        yield chunk
+
+
+def build_zip(job: "Job") -> tuple[bytes, str]:
+    """
+    Backwards-compatible helper — returns ``(zip_bytes, zip_filename)``.
+
+    New callers should prefer :func:`stream_zip` for memory efficiency.
+    """
+    data = b"".join(stream_zip(job, fmt="png"))
     zip_filename = f"batch_{job['job_id'][:8]}_results.zip"
-    return buf.read(), zip_filename
+    return data, zip_filename

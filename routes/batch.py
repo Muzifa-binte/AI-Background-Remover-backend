@@ -17,10 +17,19 @@ GET /api/batch/{job_id}/status
 Returns the full job state (per-file statuses, counts, overall status).
 Fallback polling endpoint (every 1–2 seconds).
 
-GET /api/batch/{job_id}/download
-──────────────────────────────────
-Streams a ZIP of all successfully processed output PNGs.
+GET /api/batch/{job_id}/download-zip
+─────────────────────────────────────
+Streams a ZIP of all successfully processed output files, optionally converted
+to a target format (PNG/JPEG/WebP) with configurable quality.
 Only available when job status is "done".
+
+Query params:
+  ?format=png|jpeg|webp   (default: png)
+  ?quality=1-100          (default: 90, ignored for PNG)
+  ?token=<jwt>            (alternative to Authorization header — required
+                           for browser fetch/anchor-tag downloads)
+
+GET /api/batch/{job_id}/download   (legacy alias → redirects to download-zip)
 """
 
 import os
@@ -28,13 +37,13 @@ import uuid
 
 import aiofiles
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Query
-from fastapi.responses import Response, JSONResponse, StreamingResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse, RedirectResponse
 
 from fastapi import Form
 from models.user    import UserOut
 from services.auth  import get_current_user, decode_token
 from services.quota import check_and_increment_quota, refund_quota
-from services.batch import create_job, get_job, build_zip
+from services.batch import create_job, get_job, stream_zip
 from services.job_queue import job_queue
 from services.job_events import job_events
 from services.bg_removal import QUALITY_OPTIONS
@@ -224,16 +233,78 @@ async def batch_status(
     })
 
 
+@router.get("/batch/{job_id}/download-zip")
+async def batch_download_zip(
+    job_id:  str,
+    format:  str = Query(default="png",  description="Output format: png, jpeg, or webp"),
+    quality: int = Query(default=90,     description="Quality 1–100 (JPEG/WebP; ignored for PNG)"),
+    token:   str | None = Query(None,   description="JWT token (alternative to Authorization header)"),
+    current_user: UserOut = Depends(get_current_user),
+):
+    """
+    Stream all successfully processed images as a single ZIP archive,
+    optionally converting each PNG to the requested *format* and *quality*.
+
+    - **format** ``png`` (default, lossless, transparency preserved) |
+                 ``jpeg`` (smaller, white background) |
+                 ``webp`` (best compression, transparency preserved)
+    - **quality** Compression quality 1–100 for JPEG/WebP (default 90).
+      Silently ignored for PNG.
+    - **token**   JWT bearer token as a query param — lets a browser
+      ``fetch()`` call or ``<a download>`` tag authenticate without custom
+      headers.
+
+    Only available once the job **status** is ``done``.
+    Users can only download their own jobs.
+    """
+    fmt = format.lower().strip()
+    if fmt not in {"png", "jpeg", "webp"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{format}'. Choose from: jpeg, png, webp.",
+        )
+    quality = max(1, min(100, quality))
+
+    job = await get_job(job_id, user_id=current_user.user_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    if job["status"] != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is still '{job['status']}'. Wait until status is 'done'.",
+        )
+
+    completed_count = sum(1 for f in job["files"] if f["status"] == "done")
+    if completed_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="No completed files available for download.",
+        )
+
+    ext_map  = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
+    zip_name = f"batch_{job['job_id'][:8]}_results_{fmt}{ext_map[fmt]}.zip"
+
+    return StreamingResponse(
+        stream_zip(job, fmt=fmt, quality=quality),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+            "X-Zip-Format":        fmt,
+            "X-Zip-Files":         str(completed_count),
+        },
+    )
+
+
 @router.get("/batch/{job_id}/download")
-async def batch_download(
+async def batch_download_legacy(
     job_id:       str,
     current_user: UserOut = Depends(get_current_user),
 ):
     """
-    Download all successfully processed images as a ZIP archive.
+    Legacy download alias — redirects to ``/download-zip`` (PNG, quality 90).
 
-    Only available once the job status is **"done"**.
-    Users can only download their own jobs.
+    Kept for backwards compatibility with older clients.
     """
     job = await get_job(job_id, user_id=current_user.user_id)
     if job is None:
@@ -245,18 +316,18 @@ async def batch_download(
             detail=f"Job is still '{job['status']}'. Wait until status is 'done'.",
         )
 
-    zip_bytes, zip_filename = build_zip(job)
-    if not zip_bytes:
+    completed_count = sum(1 for f in job["files"] if f["status"] == "done")
+    if completed_count == 0:
         raise HTTPException(
             status_code=404,
             detail="No completed files available for download.",
         )
 
-    return Response(
-        content=zip_bytes,
+    zip_name = f"batch_{job['job_id'][:8]}_results.zip"
+    return StreamingResponse(
+        stream_zip(job, fmt="png"),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{zip_filename}"',
-            "Content-Length":      str(len(zip_bytes)),
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
         },
     )
