@@ -4,12 +4,18 @@ Batch Processing Routes.
 POST /api/batch/start
 ─────────────────────
 Accepts up to 20 image files, saves them, creates a job record in MongoDB,
-fires a BackgroundTask to process them, and returns the job_id immediately.
+enqueues the job into the async worker pool, and returns the job_id immediately.
+
+GET /api/batch/{job_id}/events
+──────────────────────────────
+Server-Sent Events (SSE) stream yielding real-time progress events:
+  - snapshot: initial job state
+  - job_started, file_processing, file_done, file_error, job_done
 
 GET /api/batch/{job_id}/status
 ───────────────────────────────
 Returns the full job state (per-file statuses, counts, overall status).
-Poll this every 1–2 seconds from the frontend.
+Fallback polling endpoint (every 1–2 seconds).
 
 GET /api/batch/{job_id}/download
 ──────────────────────────────────
@@ -21,14 +27,16 @@ import os
 import uuid
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
-from fastapi.responses import Response, JSONResponse
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Query
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 from fastapi import Form
 from models.user    import UserOut
-from services.auth  import get_current_user
+from services.auth  import get_current_user, decode_token
 from services.quota import check_and_increment_quota, refund_quota
-from services.batch import create_job, get_job, process_batch, build_zip
+from services.batch import create_job, get_job, build_zip
+from services.job_queue import job_queue
+from services.job_events import job_events
 from services.bg_removal import QUALITY_OPTIONS
 
 router = APIRouter(tags=["Batch Processing"])
@@ -43,7 +51,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @router.post("/batch/start")
 async def batch_start(
-    background_tasks: BackgroundTasks,
     files:            list[UploadFile] = File(...),
     quality:          str              = Form("fast"),
     current_user:     UserOut          = Depends(get_current_user),
@@ -54,8 +61,8 @@ async def batch_start(
     - **files**   Up to 20 JPEG/PNG/WebP images (each ≤ 10 MB)
     - **quality** `fast` (default) | `standard` | `quality` — AI model to use
 
-    Returns a **job_id** immediately. Poll `/api/batch/{job_id}/status`
-    for progress.
+    Returns a **job_id** immediately. Connect to `/api/batch/{job_id}/events`
+    or poll `/api/batch/{job_id}/status` for progress.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
@@ -71,8 +78,6 @@ async def batch_start(
         )
 
     # ── Phase 1: validate and read every file before touching quota ──────
-    # Collect (contents, safe_name) so we only charge quota once we know
-    # the whole batch is clean. A rejected file must never consume quota.
     validated: list[tuple[bytes, str]] = []
 
     for upload in files:
@@ -94,14 +99,12 @@ async def batch_start(
         validated.append((contents, safe_name))
 
     # ── Phase 2: charge quota for every validated file ───────────────────
-    # Track how many we've charged so we can refund on an unexpected error.
     charged = 0
     try:
         for _ in validated:
             await check_and_increment_quota(current_user.user_id)
             charged += 1
     except Exception:
-        # Refund any quota already charged before re-raising
         if charged:
             await refund_quota(current_user.user_id, charged)
         raise
@@ -122,14 +125,13 @@ async def batch_start(
                 "upload_path":   upload_path,
             })
     except Exception:
-        # Refund all charged quota if we fail mid-write
         await refund_quota(current_user.user_id, charged)
         raise
 
     job_id = await create_job(file_entries, user_id=current_user.user_id, quality=quality)
 
-    # Fire-and-forget: runs in FastAPI's thread pool
-    background_tasks.add_task(process_batch, job_id)
+    # Offload to bounded async job queue worker pool
+    await job_queue.enqueue(job_id)
 
     return JSONResponse({
         "job_id":      job_id,
@@ -139,23 +141,65 @@ async def batch_start(
     })
 
 
+@router.get("/batch/{job_id}/events")
+async def batch_events(
+    job_id: str,
+    token:  str | None = Query(None, description="Optional auth token for SSE EventSource"),
+    current_user: UserOut = Depends(get_current_user),
+):
+    """
+    Stream real-time progress events for a batch job via Server-Sent Events (SSE).
+    """
+    job = await get_job(job_id, user_id=current_user.user_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    snapshot = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "quality": job.get("quality", "fast"),
+        "total": job["total"],
+        "completed": job["completed"],
+        "failed": job["failed"],
+        "files": [
+            {
+                "original_name": e["original_name"],
+                "output_filename": e["output_filename"],
+                "download_url": f"/api/download/{e['output_filename']}" if e["output_filename"] else None,
+                "status": e["status"],
+                "error": e["error"],
+            }
+            for e in job["files"]
+        ],
+    }
+
+    # If job is already done, return single snapshot event stream
+    return StreamingResponse(
+        job_events.event_generator(job_id, initial_data=snapshot),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/batch/{job_id}/status")
 async def batch_status(
     job_id:       str,
     current_user: UserOut = Depends(get_current_user),
 ):
     """
-    Get the current status of a batch job.
+    Get the current status of a batch job (fallback polling).
 
     Returns per-file statuses and overall progress counts.
-    Poll every 1–2 seconds while status is "pending" or "running".
     Users can only access their own jobs.
     """
     job = await get_job(job_id, user_id=current_user.user_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
-    # Strip server-side paths from the client response
     files_out = [
         {
             "original_name":   entry["original_name"],

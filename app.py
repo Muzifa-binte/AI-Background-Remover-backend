@@ -18,6 +18,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from services.database   import connect_db, close_db
 from services.quota      import setup_quota_indexes
 from services.cleanup    import start_cleanup_task, stop_cleanup_task
+from services.job_queue  import job_queue
 from services.bg_removal import warm_up
 from routes.auth        import router as auth_router
 from routes.remove_bg   import router as remove_bg_router
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI):
     await connect_db()
     await setup_quota_indexes()
     start_cleanup_task()
+    await job_queue.start()
     # Pre-load AI model sessions so the first request isn't slow.
     # Non-fatal: auth and other routes still work if warm-up fails.
     try:
@@ -48,6 +50,7 @@ async def lifespan(app: FastAPI):
     except BaseException as exc:
         print(f"[AI] Model warm-up skipped/failed (will initialize on first request): {exc}")
     yield
+    await job_queue.stop()
     stop_cleanup_task()
     await close_db()
 
