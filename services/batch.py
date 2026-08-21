@@ -3,6 +3,7 @@ Batch Processing Service.
 
 Manages batch background-removal jobs, persisted to MongoDB so job state
 survives server restarts and horizontal scaling is possible.
+Dispatches real-time SSE progress events via job_events.
 
 Job states
 ──────────
@@ -26,9 +27,12 @@ import os
 import sys
 import uuid
 import zipfile
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, Literal
+
+logger = logging.getLogger(__name__)
 
 # Add AI module to path (mirrors bg_removal.py pattern)
 _AI_DIR = Path(__file__).resolve().parents[2] / "AI"
@@ -36,8 +40,8 @@ if str(_AI_DIR) not in sys.path:
     sys.path.insert(0, str(_AI_DIR))
 
 from inference import run_inference  # noqa: E402
-
 from services.database import get_collection  # noqa: E402
+from services.job_events import job_events  # noqa: E402
 
 
 # ── Type definitions ───────────────────────────────────────────────────────
@@ -86,8 +90,8 @@ async def _upsert_job(job: Job) -> None:
             job,
             upsert=True,
         )
-    except Exception:
-        pass  # persistence failure should not crash the processing loop
+    except Exception as e:
+        logger.warning(f"[Batch] Failed to persist job {job.get('job_id')} to DB: {e}")
 
 
 # ── Public helpers ─────────────────────────────────────────────────────────
@@ -149,110 +153,126 @@ async def get_job(job_id: str, user_id: str | None = None) -> Job | None:
         col = _collection()
         doc = await col.find_one(query, {"_id": 0})
         return dict(doc) if doc else None  # type: ignore[arg-type]
-    except Exception:
+    except Exception as e:
+        logger.error(f"[Batch] Error fetching job {job_id}: {e}")
         return None
+
+
+async def process_batch_job(job_id: str) -> None:
+    """
+    Async batch processing task executed by the job queue workers.
+    Processes files sequentially, persists progress, and publishes SSE events.
+    """
+    job = await get_job(job_id)
+    if job is None:
+        logger.warning(f"[Batch] Job {job_id} not found for processing.")
+        return
+
+    quality = job.get("quality", "fast")
+    job["status"] = "running"
+    await _upsert_job(job)
+
+    # Publish job started event
+    await job_events.publish(job_id, "job_started", {
+        "job_id": job_id,
+        "status": "running",
+        "quality": quality,
+        "total": job["total"],
+        "completed": 0,
+        "failed": 0,
+    })
+
+    loop = asyncio.get_running_loop()
+
+    for idx, entry in enumerate(job["files"]):
+        entry["status"] = "processing"
+        await _upsert_job(job)
+
+        # Publish file processing event
+        await job_events.publish(job_id, "file_processing", {
+            "index": idx,
+            "original_name": entry["original_name"],
+            "status": "processing",
+        })
+
+        stem = Path(entry["upload_path"]).stem
+        output_filename = f"{stem}_result.png"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+        try:
+            # Run CPU-bound AI inference in thread pool executor
+            await loop.run_in_executor(
+                None,
+                run_inference,
+                entry["upload_path"],
+                output_path,
+                quality,
+            )
+            entry["output_filename"] = output_filename
+            entry["status"] = "done"
+            job["completed"] += 1
+
+            # Publish file done event
+            await job_events.publish(job_id, "file_done", {
+                "index": idx,
+                "original_name": entry["original_name"],
+                "output_filename": output_filename,
+                "download_url": f"/api/download/{output_filename}",
+                "status": "done",
+                "completed": job["completed"],
+                "failed": job["failed"],
+                "total": job["total"],
+            })
+
+        except Exception as exc:
+            logger.error(f"[Batch] Inference error on file '{entry['original_name']}': {exc}")
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            job["failed"] += 1
+
+            # Publish file error event
+            await job_events.publish(job_id, "file_error", {
+                "index": idx,
+                "original_name": entry["original_name"],
+                "status": "error",
+                "error": str(exc),
+                "completed": job["completed"],
+                "failed": job["failed"],
+                "total": job["total"],
+            })
+
+        await _upsert_job(job)
+
+    job["status"] = "done"
+    await _upsert_job(job)
+
+    # Publish final job done event
+    files_summary = [
+        {
+            "original_name": e["original_name"],
+            "output_filename": e["output_filename"],
+            "download_url": f"/api/download/{e['output_filename']}" if e["output_filename"] else None,
+            "status": e["status"],
+            "error": e["error"],
+        }
+        for e in job["files"]
+    ]
+
+    await job_events.publish(job_id, "job_done", {
+        "job_id": job_id,
+        "status": "done",
+        "total": job["total"],
+        "completed": job["completed"],
+        "failed": job["failed"],
+        "files": files_summary,
+    })
 
 
 def process_batch(job_id: str) -> None:
     """
-    Background task entry point. Runs in FastAPI's thread-pool executor.
-
-    Iterates over queued files, runs bg removal on each using the quality
-    stored on the job, and persists per-file and overall job status to
-    MongoDB after every file.
-
-    Motor (async) collections are bound to the event loop that created the
-    Motor client (FastAPI's main loop).  We must NOT call those collections
-    from a *different* event loop — doing so raises
-    ``RuntimeError: Task attached to a different loop``.
-
-    Fix: spin up a brand-new Motor client (and therefore a fresh event-loop-
-    independent connection) inside the dedicated asyncio.run() call.  The
-    client is closed before the coroutine returns, so no connection is leaked.
+    Synchronous fallback wrapper for FastAPI BackgroundTasks.
     """
-    asyncio.run(_process_batch_async(job_id))
-
-
-async def _process_batch_async(job_id: str) -> None:
-    """
-    Async implementation of batch processing.
-
-    Creates its own Motor client so it is fully decoupled from the Motor
-    client that lives on FastAPI's main event loop.
-    """
-    import os as _os
-    from motor.motor_asyncio import AsyncIOMotorClient
-
-    mongo_uri   = _os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    db_name     = _os.getenv("MONGO_DB_NAME", "ai_bg_remover")
-
-    _uri_lower  = mongo_uri.lower()
-    _use_tls    = (
-        "ssl=true" in _uri_lower
-        or "tls=true" in _uri_lower
-        or _uri_lower.startswith("mongodb+srv://")
-    )
-    _tls_kwargs = {"tls": True, "tlsAllowInvalidCertificates": False} if _use_tls else {}
-
-    _client = AsyncIOMotorClient(
-        mongo_uri,
-        serverSelectionTimeoutMS=10000,
-        connectTimeoutMS=10000,
-        socketTimeoutMS=15000,
-        **_tls_kwargs,
-    )
-    col = _client[db_name]["batch_jobs"]
-
-    async def _upsert(job: Job) -> None:
-        try:
-            await col.replace_one({"job_id": job["job_id"]}, job, upsert=True)
-        except Exception:
-            pass
-
-    async def _fetch() -> Job | None:
-        try:
-            doc = await col.find_one({"job_id": job_id}, {"_id": 0})
-            return dict(doc) if doc else None  # type: ignore[arg-type]
-        except Exception:
-            return None
-
-    try:
-        job = await _fetch()
-        if job is None:
-            return
-
-        # Honour the quality chosen by the user; fall back to "fast" for
-        # jobs created before the quality field was added.
-        quality = job.get("quality", "fast")
-
-        job["status"] = "running"
-        await _upsert(job)
-
-        for entry in job["files"]:
-            entry["status"] = "processing"
-            await _upsert(job)
-
-            stem            = Path(entry["upload_path"]).stem
-            output_filename = f"{stem}_result.png"
-            output_path     = os.path.join(OUTPUT_DIR, output_filename)
-
-            try:
-                run_inference(entry["upload_path"], output_path, quality=quality)
-                entry["output_filename"] = output_filename
-                entry["status"]          = "done"
-                job["completed"]        += 1
-            except Exception as exc:
-                entry["status"] = "error"
-                entry["error"]  = str(exc)
-                job["failed"]  += 1
-
-            await _upsert(job)
-
-        job["status"] = "done"
-        await _upsert(job)
-
-    finally:
-        _client.close()
+    asyncio.run(process_batch_job(job_id))
 
 
 def build_zip(job: Job) -> tuple[bytes, str]:
