@@ -8,6 +8,7 @@ from services.compositing import composite_background
 from services.auth        import get_current_user
 from services.quota       import check_and_increment_quota
 from services.storage     import save_file, get_download_url
+from services.tracking    import track_usage, track_action
 from models.user          import UserOut
 
 router = APIRouter(tags=["Background Replacement"])
@@ -102,6 +103,16 @@ async def replace_background_endpoint(
         })
     except Exception:
         pass
+
+    await track_usage(
+        user_id=current_user.user_id, feature="replace_bg", image_id=result_id,
+        metadata={"bg_type": bg_type},
+    )
+    await track_action(
+        user_id=current_user.user_id, image_id=result_id, action_type="replace_bg",
+        suggestion=f"Replaced background with '{bg_type}' mode",
+        applied=True,
+    )
 
     return JSONResponse({
         "result_id": result_id, "output_filename": output_filename,

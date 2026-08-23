@@ -8,6 +8,7 @@ from services.enhancement import enhance_image
 from services.auth        import get_current_user
 from services.quota       import check_and_increment_quota
 from services.storage     import save_file
+from services.tracking    import track_usage, track_action
 from models.user          import UserOut
 
 router = APIRouter(tags=["Enhancement"])
@@ -90,6 +91,16 @@ async def enhance_endpoint(
         })
     except Exception:
         pass
+
+    await track_usage(
+        user_id=current_user.user_id, feature="enhance", image_id=upload_id,
+        metadata={"denoise": denoise, "auto_wb": auto_wb},
+    )
+    await track_action(
+        user_id=current_user.user_id, image_id=upload_id, action_type="enhance",
+        suggestion="Applied brightness/contrast/saturation/sharpness enhancement",
+        applied=True,
+    )
 
     return JSONResponse({
         "upload_id": upload_id, "output_filename": output_filename,

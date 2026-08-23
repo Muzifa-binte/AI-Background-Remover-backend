@@ -4,11 +4,17 @@ from models.ai import ChatResponse
 from services.ai_service import AIService
 from services.image_service import ImageService
 from services.auth import get_current_user
+from services.tracking import track_usage, track_cost
 from models.user import UserOut
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 ai_service = AIService()
 image_service = ImageService()
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars per token) when the provider doesn't return exact counts."""
+    return max(1, len(text) // 4)
 
 
 @router.post("", response_model=ChatResponse)
@@ -31,6 +37,24 @@ async def chat(
             image_bytes = image_service.preprocess(raw_bytes)
 
         reply, thinking = await ai_service.chat(message, image_bytes)
+
+        # ── Analytics & Insights: usage + cost tracking (best-effort) ───────
+        await track_usage(
+            user_id=current_user.user_id,
+            feature="chat",
+            metadata={"has_image": bool(image_bytes)},
+        )
+        input_tokens = _estimate_tokens(message)
+        output_tokens = _estimate_tokens(reply)
+        await track_cost(
+            user_id=current_user.user_id,
+            feature="chat",
+            provider=ai_service.provider,
+            model=ai_service.vision_model if image_bytes else ai_service.chat_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
         return ChatResponse(reply=reply, thinking=thinking)
     except HTTPException:
         raise
