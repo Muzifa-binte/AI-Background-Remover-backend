@@ -9,6 +9,7 @@ from services.smart_crop import smart_crop, get_aspect_ratio_keys
 from services.auth       import get_current_user
 from services.quota      import check_and_increment_quota
 from services.storage    import save_file
+from services.tracking   import track_usage, track_action
 from models.user         import UserOut
 
 router = APIRouter(tags=["Smart Crop"])
@@ -83,7 +84,7 @@ async def smart_crop_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Smart crop failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Smartcrop failed: {exc}")
 
     removed_url = await save_file(removed_path, removed_filename)
     cropped_url = await save_file(cropped_path, cropped_filename)
@@ -102,6 +103,16 @@ async def smart_crop_endpoint(
         })
     except Exception:
         pass
+
+    await track_usage(
+        user_id=current_user.user_id, feature="smart_crop", image_id=upload_id,
+        metadata={"aspect_ratio": aspect_ratio, "quality": quality},
+    )
+    await track_action(
+        user_id=current_user.user_id, image_id=upload_id, action_type="smart_crop",
+        suggestion=f"Smart-cropped to aspect ratio '{aspect_ratio}'",
+        applied=True,
+    )
 
     return JSONResponse({
         "upload_id": upload_id,

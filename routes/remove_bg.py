@@ -5,6 +5,7 @@ from services.database    import get_collection
 from services.auth        import get_current_user
 from services.quota       import check_and_increment_quota
 from services.storage     import save_file
+from services.tracking    import track_usage, track_action
 from models.user          import UserOut
 import aiofiles
 import os
@@ -87,9 +88,23 @@ async def remove_bg_endpoint(
     except Exception:
         pass
 
+    # ── Analytics & Insights: usage + action tracking (best-effort) ─────────
+    await track_usage(
+        user_id=current_user.user_id,
+        feature="remove_bg",
+        image_id=upload_id,
+        metadata={"quality": quality},
+    )
+    await track_action(
+        user_id=current_user.user_id,
+        image_id=upload_id,
+        action_type="remove_bg",
+        suggestion=f"Removed background using '{quality}' quality model",
+        applied=True,
+    )
+
     return JSONResponse({
         "output_filename": output_filename,
         "download_url":    download_url,
         "quality":         quality,
-
     })
