@@ -1,5 +1,14 @@
+import asyncio
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends
-from models.ai import ImageAnalysisResponse, CaptionResponse, CaptionsResponse, BackgroundSuggestionsResponse
+from models.ai import (
+    ImageAnalysisResponse,
+    CaptionResponse,
+    CaptionsResponse,
+    BackgroundSuggestionsResponse,
+    AdvancedAnalysisResponse,
+    BatchAdvancedAnalysisResponse,
+    BatchAdvancedAnalysisItem
+)
 from services.ai_service import AIService
 from services.image_service import ImageService
 from services.auth import get_current_user
@@ -126,3 +135,75 @@ async def background_suggestions(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+@router.post("/analyze-advanced", response_model=AdvancedAnalysisResponse)
+async def analyze_image_advanced(
+    file: UploadFile = File(...),
+    current_user: UserOut = Depends(get_current_user)
+):
+    contents = await file.read()
+    if not image_service.validate(contents):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Supported formats are: JPEG, PNG, WEBP."
+        )
+
+    preprocessed_bytes = image_service.preprocess(contents)
+
+    try:
+        analysis = await ai_service.analyze_image_advanced(preprocessed_bytes)
+        return AdvancedAnalysisResponse(**analysis)
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.post("/analyze-advanced-batch", response_model=BatchAdvancedAnalysisResponse)
+async def analyze_image_advanced_batch(
+    files: list[UploadFile] = File(...),
+    current_user: UserOut = Depends(get_current_user)
+):
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No files provided."
+        )
+    if len(files) > 10:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 10 files per batch analysis."
+        )
+
+    async def process_single_file(upload: UploadFile) -> BatchAdvancedAnalysisItem:
+        try:
+            contents = await upload.read()
+            if not image_service.validate(contents):
+                return BatchAdvancedAnalysisItem(
+                    filename=upload.filename or "unknown",
+                    status="error",
+                    error="Invalid image format. Supported formats are: JPEG, PNG, WEBP."
+                )
+            preprocessed = image_service.preprocess(contents)
+            analysis = await ai_service.analyze_image_advanced(preprocessed)
+            return BatchAdvancedAnalysisItem(
+                filename=upload.filename or "unknown",
+                status="success",
+                analysis=AdvancedAnalysisResponse(**analysis)
+            )
+        except Exception as e:
+            return BatchAdvancedAnalysisItem(
+                filename=upload.filename or "unknown",
+                status="error",
+                error=str(e)
+            )
+
+    results = await asyncio.gather(*(process_single_file(f) for f in files))
+    return BatchAdvancedAnalysisResponse(results=list(results))

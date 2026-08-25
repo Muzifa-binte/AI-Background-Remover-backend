@@ -25,6 +25,7 @@ from services.quota       import check_and_increment_quota
 from services.storage     import save_file
 from services.database    import get_collection
 from services.recolor     import recolor_region
+from services.tracking    import track_usage, track_action
 from models.user          import UserOut
 
 router = APIRouter(tags=["Magic Recolor"])
@@ -58,7 +59,6 @@ async def recolor_endpoint(
     """
     await check_and_increment_quota(current_user.user_id)
 
-    # ── Validate source image ─────────────────────────────────────────────
     if image.content_type not in ALLOWED_TYPES:
         raise HTTPException(
             status_code=400,
@@ -72,12 +72,10 @@ async def recolor_endpoint(
             detail=f"Source image exceeds {MAX_SIZE_MB} MB limit.",
         )
 
-    # ── Validate mask ─────────────────────────────────────────────────────
     mask_bytes = await mask.read()
     if not mask_bytes:
         raise HTTPException(status_code=400, detail="Mask is empty.")
 
-    # ── Validate target colour ────────────────────────────────────────────
     target_color = target_color.strip()
     if not target_color.startswith("#") or len(target_color.lstrip("#")) not in (3, 6):
         raise HTTPException(
@@ -85,11 +83,9 @@ async def recolor_endpoint(
             detail="target_color must be a CSS hex string, e.g. #e83c6d or #f00.",
         )
 
-    # ── Clamp numeric params ──────────────────────────────────────────────
     strength = max(0.0, min(1.0, strength))
     feather  = max(0,   min(60, feather))
 
-    # ── Run CPU-bound recolor in thread executor ──────────────────────────
     try:
         loop = asyncio.get_event_loop()
         result_bytes = await loop.run_in_executor(
@@ -107,7 +103,6 @@ async def recolor_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Recolor failed: {exc}")
 
-    # ── Persist result PNG ────────────────────────────────────────────────
     upload_id       = str(uuid.uuid4())
     safe_name       = os.path.basename(image.filename or "upload")
     output_filename = f"{upload_id}_recolored.png"
@@ -118,7 +113,6 @@ async def recolor_endpoint(
 
     download_url = await save_file(output_path, output_filename)
 
-    # ── Save history record ───────────────────────────────────────────────
     try:
         collection = get_collection("recolor_history")
         await collection.insert_one({
@@ -135,7 +129,17 @@ async def recolor_endpoint(
             "created_at": datetime.now(timezone.utc),
         })
     except Exception:
-        pass  # history is best-effort
+        pass
+
+    await track_usage(
+        user_id=current_user.user_id, feature="recolor", image_id=upload_id,
+        metadata={"target_color": target_color, "strength": strength},
+    )
+    await track_action(
+        user_id=current_user.user_id, image_id=upload_id, action_type="recolor",
+        suggestion=f"Recolored painted region to {target_color}",
+        applied=True,
+    )
 
     return JSONResponse({
         "upload_id":       upload_id,

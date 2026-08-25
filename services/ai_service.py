@@ -186,9 +186,23 @@ class AIService:
         reply = self._clean_text(text)
         return reply, thinking
 
-    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> Tuple[str, Optional[str]]:
-        """Chat with AI assistant with retry logic and enhanced error handling."""
+    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+        """Chat with AI assistant with retry logic, action extraction, and enhanced error handling."""
         self._verify_configuration()
+
+        system_instructions = (
+            "You are a professional designer and helpful assistant for the AI Background Remover application. "
+            "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions.\n"
+            "If the user asks you to perform an editing action (such as applying a white background, solid color background, a studio background, adjusting enhancement settings like brightness/contrast/saturation, or cropping the image to a specific aspect ratio), "
+            "you must append a single line to the very end of your response starting with '[ACTION:' and ending with ']' containing a JSON payload detailing the requested action. "
+            "Do not include code block ticks in the action line. Keep it as a raw single line.\n"
+            "Examples:\n"
+            "- To change background color: [ACTION: {\"type\": \"apply_bg\", \"bgType\": \"solid\", \"solidColor\": \"#ffffff\"}]\n"
+            "- To apply a library background: [ACTION: {\"type\": \"apply_bg\", \"bgType\": \"library\", \"libraryUrl\": \"https://images.unsplash.com/photo-1553356084-58ef4a67b2a7?w=1200\"}]\n"
+            "- To enhance settings: [ACTION: {\"type\": \"apply_enhance\", \"brightness\": 1.2, \"contrast\": 1.1, \"saturation\": 1.0, \"sharpness\": 1.2, \"denoise\": false, \"auto_wb\": true, \"denoise_strength\": 9}]\n"
+            "- To crop settings: [ACTION: {\"type\": \"apply_crop\", \"aspectRatio\": \"1:1\", \"paddingPct\": 0.1}]\n"
+            "Make sure to return only valid action payloads when requested."
+        )
 
         async def _chat_impl() -> Tuple[str, Optional[str]]:
             if self.provider == "gemini":
@@ -198,13 +212,16 @@ class AIService:
                 if image_bytes:
                     img = Image.open(BytesIO(image_bytes)).convert("RGB")
                     prompt = (
-                        "You are a professional designer and helpful assistant for the AI Background Remover application. "
-                        "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions.\n\n"
+                        f"{system_instructions}\n\n"
                         f"User Message: {message}"
                     )
                     response = await model.generate_content_async([prompt, img])
                 else:
-                    response = await model.generate_content_async(message)
+                    prompt = (
+                        f"{system_instructions}\n\n"
+                        f"User Message: {message}"
+                    )
+                    response = await model.generate_content_async(prompt)
 
                 raw_reply = response.text or "No response from AI."
                 return self._extract_thinking(raw_reply)
@@ -214,10 +231,7 @@ class AIService:
                 messages: List[Dict[str, Any]] = [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a professional designer and helpful assistant for the AI Background Remover application. "
-                            "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions."
-                        )
+                        "content": system_instructions
                     }
                 ]
                 if image_bytes:
@@ -243,7 +257,19 @@ class AIService:
                 return self._extract_thinking(raw_reply)
 
         try:
-            return await self._retry_with_backoff(_chat_impl)
+            reply, thinking = await self._retry_with_backoff(_chat_impl)
+            
+            # Extract and parse action block if present
+            action = None
+            action_match = re.search(r'\[ACTION:\s*(\{.*?\})\s*\]', reply)
+            if action_match:
+                try:
+                    action = json.loads(action_match.group(1).strip())
+                    reply = re.sub(r'\[ACTION:\s*\{.*?\}\s*\]', '', reply).strip()
+                except Exception as e:
+                    logger.warning(f"Failed to parse action JSON: {e}")
+            
+            return reply, thinking, action
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Chat failed after retries: {error_msg}")
@@ -571,3 +597,123 @@ class AIService:
                 raise RuntimeError("AI service quota exceeded during background suggestions. Please check your plan and usage.")
             else:
                 raise RuntimeError(f"Unable to generate background suggestions: {error_msg}. Please try again later.")
+
+    async def analyze_image_advanced(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Perform advanced analysis including object detection, color extraction, style recommendations, and composition analysis."""
+        self._verify_configuration()
+
+        async def _analyze_impl() -> Dict[str, Any]:
+            system_prompt = (
+                "You are an expert AI design assistant specializing in image analysis, object detection, color theory, and composition.\n"
+                "Analyze the image and return a JSON object matching this schema:\n"
+                "{\n"
+                "  \"object_detection\": [\n"
+                "    {\n"
+                "      \"label\": \"Name of the detected object (e.g. Person, Handbag, Wine Bottle, Cat)\",\n"
+                "      \"box_2d\": [ymin, xmin, ymax, xmax],\n"\
+                "      \"confidence\": 0.95\n"
+                "    }\n"
+                "  ],\n"
+                "  \"color_palette\": [\n"
+                "    {\n"
+                "      \"hex\": \"#HEXCODE (e.g., #3A5F43)\",\n"
+                "      \"name\": \"Friendly color name (e.g., Forest Green)\",\n"
+                "      \"percentage\": 40,\n"
+                "      \"text_color\": \"#ffffff or #000000 (suitable for text overlay on this color)\",\n"
+                "      \"use_case\": \"Design advice for this color (e.g., Use as a background accent to highlight warm subject elements.)\"\n"
+                "    }\n"
+                "  ],\n"
+                "  \"style_transfer\": [\n"
+                "    {\n"
+                "      \"style\": \"Name of recommended filter/artistic style (e.g. Vaporwave, Cyberpunk, Cinematic Studio, Minimalist Pastel, Pop Art)\",\n"
+                "      \"description\": \"Description of the style recommendations for the subject.\",\n"
+                "      \"prompts\": \"Suggested text prompts to generate backgrounds in this style\"\n"
+                "    }\n"
+                "  ],\n"
+                "  \"composition\": {\n"
+                "    \"rule_of_thirds\": \"Analysis of how subject alignment adheres to or breaks the rule of thirds.\",\n"
+                "    \"leading_lines\": \"Analysis of leading lines in the image and how they guide the viewer's eye.\",\n"
+                "    \"balance\": \"Assessment of visual balance (e.g. Symmetric, Asymmetric, Radial) and weight distribution.\",\n"
+                "    \"crop_recommendation\": \"Recommendations for cropping or positioning to enhance composition.\"\n"
+                "  },\n"
+                "  \"suggested_backgrounds\": [\n"
+                "    \"Suggest a solid color hex code (e.g., #FFFFFF) or library backdrop term (e.g., Soft White Studio, Light Grey Wall, Marble Surface, Green Forest, Autumn Leaves, City Skyline, Night Streets, Modern Office)\"\n"
+                "  ],\n"
+                "  \"optimal_enhancement\": {\n"
+                "    \"brightness\": 1.0,\n"
+                "    \"contrast\": 1.0,\n"
+                "    \"saturation\": 1.0,\n"
+                "    \"sharpness\": 1.0,\n"
+                "    \"denoise\": false,\n"
+                "    \"auto_wb\": false,\n"
+                "    \"denoise_strength\": 9\n"
+                "  },\n"
+                "  \"suggested_crop\": {\n"
+                "    \"aspect_ratio\": \"free\",\n"
+                "    \"padding_pct\": 0.05\n"
+                "  },\n"
+                "  \"suggested_filename\": \"Descriptive, SEO-friendly filename based on the subject (e.g., warm_knit_sweater_portrait or hydrate_serum_cosmetic_bottle). Format as lowercase snake_case without extension.\"\n"
+                "}\n\n"
+                "Ensure all box_2d coordinate values are integers in the range [0, 100] representing percentages of the image height and width.\n"
+                "Ensure suggested_crop.aspect_ratio is one of: 'free', '1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '5:4', '4:5'.\n"
+                "Respond ONLY with a valid JSON object matching this structure."
+            )
+
+            if self.provider == "gemini":
+                if genai is None:
+                    raise RuntimeError("Gemini package is not available.")
+                model = genai.GenerativeModel(self.vision_model)
+                img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                response = await model.generate_content_async([system_prompt, img])
+                raw_text = response.text or ""
+                return self._extract_json(raw_text)
+            else:
+                if self.client is None:
+                    raise RuntimeError("Groq client is not initialized.")
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                image_url = f"data:image/jpeg;base64,{base64_image}"
+
+                prompt = (
+                    f"{system_prompt}\n"
+                    "Keep your thinking/reasoning process extremely brief (1-2 sentences), then output the JSON object. "
+                    "Respond ONLY with the JSON object."
+                )
+
+                response = await self.client.chat.completions.create(
+                    model=self.vision_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=2048
+                )
+                raw_text = response.choices[0].message.content or ""
+                return self._extract_json(raw_text)
+
+        try:
+            return await self._retry_with_backoff(_analyze_impl)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Advanced image analysis failed after retries: {error_msg}")
+
+            if "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+                raise RuntimeError("AI service authentication failed during advanced analysis. Please check your API key configuration.")
+            elif "rate limit" in error_msg.lower():
+                raise RuntimeError("AI service rate limit exceeded during advanced analysis. Please wait a moment and try again.")
+            elif "timeout" in error_msg.lower():
+                raise RuntimeError("AI service timed out during advanced analysis. Please check your connection and try again.")
+            elif "quota" in error_msg.lower():
+                raise RuntimeError("AI service quota exceeded during advanced analysis. Please check your plan and usage.")
+            else:
+                raise RuntimeError(f"Unable to perform advanced analysis: {error_msg}. Please try again later.")
