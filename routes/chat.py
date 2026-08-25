@@ -36,7 +36,7 @@ async def chat(
 
             image_bytes = image_service.preprocess(raw_bytes)
 
-        reply, thinking = await ai_service.chat(message, image_bytes)
+        reply, thinking, action = await ai_service.chat(message, image_bytes)
 
         # ── Analytics & Insights: usage + cost tracking (best-effort) ───────
         await track_usage(
@@ -55,7 +55,7 @@ async def chat(
             output_tokens=output_tokens,
         )
 
-        return ChatResponse(reply=reply, thinking=thinking)
+        return ChatResponse(reply=reply, thinking=thinking, action=action)
     except HTTPException:
         raise
     except ValueError as ve:
