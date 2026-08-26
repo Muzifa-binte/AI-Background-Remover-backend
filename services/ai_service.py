@@ -518,10 +518,17 @@ class AIService:
 
         async def _suggestions_impl() -> List[str]:
             system_prompt = (
-                "You are a professional designer. Analyze the image and recommend 3 to 5 background placement ideas. "
-                "Your recommendations should suggest solid colors, scenes, or textures that will make the subject pop. "
-                "Respond ONLY with a valid JSON object containing the key 'suggestions' pointing to a list of strings.\n"
-                'Example format: {"suggestions": ["Studio Soft Gray", "Sunlit Minimalist Office", "Vibrant Cyberpunk Streets"]}'
+                "You are an expert art director and visual stylist for a professional photography and design studio. "
+                "Carefully inspect the uploaded image to identify the exact subject (e.g. animal/bird/pet, product/handbag/shoe, beauty/cosmetic, portrait, food, electronics), "
+                "its dominant color palette, lighting temperature, and aesthetic mood.\n\n"
+                "Generate exactly 4 distinct, highly relevant background recommendations that perfectly match the vibe, context, and color harmony of this specific subject:\n"
+                "1. Natural/Environmental Context Backdrop (a realistic, picturesque setting where the subject naturally thrives or looks stunning)\n"
+                "2. Professional Studio / Aesthetic Texture Backdrop (a clean, luxurious studio texture like marble, terracotta, linen, dark concrete, or warm wood that makes the subject pop)\n"
+                "3. Harmonious Color / Gradient Theme (a complementary or contrasting color theme based on the subject's palette, e.g. 'Deep Indigo Matte Studio' or 'Warm Terracotta Wall')\n"
+                "4. Creative / Atmospheric Scene (an atmospheric backdrop like sunlit botanical garden, golden hour meadow, blurred cinematic bokeh, or modern architecture)\n\n"
+                "Ensure every suggestion is descriptive and evocative (e.g., 'Misty Amazonian Rainforest Canopy', 'Warm Terracotta Clay Wall', 'Minimalist Italian White Marble Studio', 'Sunlit Blooming Hibiscus Garden'). "
+                "Respond ONLY with a valid JSON object containing the key 'suggestions' pointing to an array of 4 descriptive strings.\n"
+                'Example: {"suggestions": ["Misty Amazonian Rainforest Canopy", "Warm Terracotta Clay Wall", "Sunlit Blooming Hibiscus Garden", "Deep Indigo Matte Studio"]}'
             )
 
             if self.provider == "gemini":
