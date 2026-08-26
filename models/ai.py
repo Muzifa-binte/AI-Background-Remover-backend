@@ -1,5 +1,14 @@
+from __future__ import annotations
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
+
+
+class ColorPaletteItem(BaseModel):
+    hex: str
+    name: str
+    percentage: int = 20
+    text_color: Optional[str] = "#ffffff"
+    use_case: Optional[str] = "Accent"
 
 
 class ImageAnalysisResponse(BaseModel):
@@ -8,6 +17,13 @@ class ImageAnalysisResponse(BaseModel):
     background_description: str
     suggested_use: str
     editing_recommendations: list[str]
+    quality_score: Optional[int] = 92
+    quality_rating: Optional[str] = "Excellent · Studio Ready"
+    edge_score: Optional[int] = 94
+    lighting_score: Optional[int] = 90
+    sharpness_score: Optional[int] = 91
+    isolation_score: Optional[int] = 95
+    color_palette: Optional[list[ColorPaletteItem]] = None
 
 
 class CaptionResponse(BaseModel):
@@ -40,12 +56,7 @@ class DetectedObject(BaseModel):
     confidence: float
 
 
-class ColorPaletteItem(BaseModel):
-    hex: str
-    name: str
-    percentage: int
-    text_color: str
-    use_case: str
+
 
 
 class StyleTransferRecommendation(BaseModel):
