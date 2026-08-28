@@ -43,6 +43,7 @@ from routes.action_history import router as action_history_router
 from routes.collab         import router as collab_router
 from routes.analytics      import router as analytics_router
 from routes.inpaint        import router as inpaint_router
+from routes.vectorize      import router as vectorize_router
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
@@ -102,8 +103,10 @@ app.include_router(action_history_router, prefix="/api")
 app.include_router(collab_router,         prefix="/api")
 app.include_router(analytics_router,      prefix="/api")
 app.include_router(inpaint_router,        prefix="/api")
+app.include_router(vectorize_router,      prefix="/api")
 
 
 @app.get("/", tags=["Health"])
 async def root():
     return {"status": "ok", "message": "AI Background Remover API v2 is running."}
+
