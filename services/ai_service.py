@@ -23,10 +23,12 @@ except ImportError:
     _openai_available = False
 
 try:
-    import google.generativeai as genai
+    from google import genai as genai_new
+    from google.genai import types as genai_types
     _genai_available = True
 except ImportError:
-    genai = None  # type: ignore[assignment]
+    genai_new = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
     _genai_available = False
 
 
@@ -65,17 +67,18 @@ class AIService:
         else:
             # Default to Gemini
             self.provider = "gemini"
-            if not _genai_available or genai is None:
+            if not _genai_available or genai_new is None:
                 raise ImportError(
-                    "The 'google-generativeai' package is not installed. Run: pip install google-generativeai"
+                    "The 'google-genai' package is not installed. Run: pip install google-genai"
                 )
             self.api_key = os.getenv("GEMINI_API_KEY", "")
             self.is_configured = bool(self.api_key and "your_gemini_api_key" not in self.api_key)
             if self.is_configured:
-                genai.configure(api_key=self.api_key)
-            self.chat_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
-            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
-            self.client = None
+                self.client = genai_new.Client(api_key=self.api_key)
+            else:
+                self.client = None
+            self.chat_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.6-flash")
+            self.vision_model = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash")
 
     async def _retry_with_backoff(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
         """Retry an async function with exponential backoff."""
@@ -130,7 +133,6 @@ class AIService:
                 f"Please set a valid {key_name} in the .env file. "
                 f"Make sure the .env file exists in the backend directory and contains your API key."
             )
-
     def _clean_text(self, text: str) -> str:
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
         text = re.sub(r'<think>.*', '', text, flags=re.DOTALL)
@@ -206,23 +208,26 @@ class AIService:
 
         async def _chat_impl() -> Tuple[str, Optional[str]]:
             if self.provider == "gemini":
-                if genai is None:
-                    raise RuntimeError("Gemini package is not available.")
-                model = genai.GenerativeModel(self.chat_model)
+                if genai_new is None or self.client is None:
+                    raise RuntimeError("Gemini client is not available.")
                 if image_bytes:
                     img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                    prompt = (
-                        f"{system_instructions}\n\n"
-                        f"User Message: {message}"
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG")
+                    img_part = genai_types.Part.from_bytes(
+                        data=buf.getvalue(), mime_type="image/jpeg"
                     )
-                    response = await model.generate_content_async([prompt, img])
+                    prompt = f"{system_instructions}\n\nUser Message: {message}"
+                    response = await self.client.aio.models.generate_content(
+                        model=self.chat_model,
+                        contents=[prompt, img_part],
+                    )
                 else:
-                    prompt = (
-                        f"{system_instructions}\n\n"
-                        f"User Message: {message}"
+                    prompt = f"{system_instructions}\n\nUser Message: {message}"
+                    response = await self.client.aio.models.generate_content(
+                        model=self.chat_model,
+                        contents=prompt,
                     )
-                    response = await model.generate_content_async(prompt)
-
                 raw_reply = response.text or "No response from AI."
                 return self._extract_thinking(raw_reply)
             else:
@@ -321,11 +326,18 @@ class AIService:
             )
 
             if self.provider == "gemini":
-                if genai is None:
-                    raise RuntimeError("Gemini package is not available.")
-                model = genai.GenerativeModel(self.vision_model)
+                if genai_new is None or self.client is None:
+                    raise RuntimeError("Gemini client is not available.")
                 img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                response = await model.generate_content_async([system_prompt, img])
+                buf = BytesIO()
+                img.save(buf, format="JPEG")
+                img_part = genai_types.Part.from_bytes(
+                    data=buf.getvalue(), mime_type="image/jpeg"
+                )
+                response = await self.client.aio.models.generate_content(
+                    model=self.vision_model,
+                    contents=[system_prompt, img_part],
+                )
                 raw_text = response.text or ""
                 data = self._extract_json(raw_text)
             else:
@@ -412,11 +424,18 @@ class AIService:
             prompt = f"Write a single photo caption for this image in a {style.upper()} tone. Tone details: {tone} Respond ONLY with the caption text."
 
             if self.provider == "gemini":
-                if genai is None:
-                    raise RuntimeError("Gemini package is not available.")
-                model = genai.GenerativeModel(self.vision_model)
+                if genai_new is None or self.client is None:
+                    raise RuntimeError("Gemini client is not available.")
                 img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                response = await model.generate_content_async([prompt, img])
+                buf = BytesIO()
+                img.save(buf, format="JPEG")
+                img_part = genai_types.Part.from_bytes(
+                    data=buf.getvalue(), mime_type="image/jpeg"
+                )
+                response = await self.client.aio.models.generate_content(
+                    model=self.vision_model,
+                    contents=[prompt, img_part],
+                )
                 caption_text = response.text or ""
                 return self._clean_text(caption_text).strip().strip('"')
             else:
@@ -489,11 +508,18 @@ class AIService:
             )
 
             if self.provider == "gemini":
-                if genai is None:
-                    raise RuntimeError("Gemini package is not available.")
-                model = genai.GenerativeModel(self.vision_model)
+                if genai_new is None or self.client is None:
+                    raise RuntimeError("Gemini client is not available.")
                 img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                response = await model.generate_content_async([prompt, img])
+                buf = BytesIO()
+                img.save(buf, format="JPEG")
+                img_part = genai_types.Part.from_bytes(
+                    data=buf.getvalue(), mime_type="image/jpeg"
+                )
+                response = await self.client.aio.models.generate_content(
+                    model=self.vision_model,
+                    contents=[prompt, img_part],
+                )
                 raw_text = response.text or ""
                 parsed = self._extract_json(raw_text)
                 if isinstance(parsed, list):
@@ -562,11 +588,18 @@ class AIService:
             )
 
             if self.provider == "gemini":
-                if genai is None:
-                    raise RuntimeError("Gemini package is not available.")
-                model = genai.GenerativeModel(self.vision_model)
+                if genai_new is None or self.client is None:
+                    raise RuntimeError("Gemini client is not available.")
                 img = Image.open(BytesIO(image_bytes))
-                response = await model.generate_content_async([system_prompt, img])
+                buf = BytesIO()
+                img.save(buf, format="JPEG")
+                img_part = genai_types.Part.from_bytes(
+                    data=buf.getvalue(), mime_type="image/jpeg"
+                )
+                response = await self.client.aio.models.generate_content(
+                    model=self.vision_model,
+                    contents=[system_prompt, img_part],
+                )
                 raw_text = response.text or ""
                 parsed = self._extract_json(raw_text)
             else:
