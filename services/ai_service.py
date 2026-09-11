@@ -188,9 +188,20 @@ class AIService:
         reply = self._clean_text(text)
         return reply, thinking
 
-    async def chat(self, message: str, image_bytes: Optional[bytes] = None) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
-        """Chat with AI assistant with retry logic, action extraction, and enhanced error handling."""
+    async def chat(
+        self,
+        message: str,
+        image_bytes: Optional[bytes] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+        """Chat with AI assistant with retry logic, action extraction, real
+        multi-turn history, and enhanced error handling.
+
+        history: optional list of {"role": "user"|"assistant", "content": str}
+        prior turns, given as real conversation context (not a pasted prefix).
+        """
         self._verify_configuration()
+        history = history or []
 
         system_instructions = (
             "You are a professional designer and helpful assistant for the AI Background Remover application. "
@@ -207,9 +218,30 @@ class AIService:
         )
 
         async def _chat_impl() -> Tuple[str, Optional[str]]:
+            system_prompt = (
+                "You are a professional designer and helpful assistant for the AI Background Remover application. "
+                "You are answering user queries about the uploaded image. Help them with background recommendations, editing advice, and captions."
+            )
+
             if self.provider == "gemini":
                 if genai_new is None or self.client is None:
                     raise RuntimeError("Gemini client is not available.")
+
+                # Build real multi-turn history in the new genai SDK's content format.
+                gemini_history = [
+                    {
+                        "role": "model" if turn.get("role") == "assistant" else "user",
+                        "parts": [{"text": turn.get("content", "")}],
+                    }
+                    for turn in history
+                ]
+
+                chat_session = self.client.aio.chats.create(
+                    model=self.chat_model,
+                    history=gemini_history,
+                )
+
+                prompt = f"{system_instructions}\n\nUser Message: {message}"
                 if image_bytes:
                     img = Image.open(BytesIO(image_bytes)).convert("RGB")
                     buf = BytesIO()
@@ -217,17 +249,10 @@ class AIService:
                     img_part = genai_types.Part.from_bytes(
                         data=buf.getvalue(), mime_type="image/jpeg"
                     )
-                    prompt = f"{system_instructions}\n\nUser Message: {message}"
-                    response = await self.client.aio.models.generate_content(
-                        model=self.chat_model,
-                        contents=[prompt, img_part],
-                    )
+                    response = await chat_session.send_message([prompt, img_part])
                 else:
-                    prompt = f"{system_instructions}\n\nUser Message: {message}"
-                    response = await self.client.aio.models.generate_content(
-                        model=self.chat_model,
-                        contents=prompt,
-                    )
+                    response = await chat_session.send_message(prompt)
+
                 raw_reply = response.text or "No response from AI."
                 return self._extract_thinking(raw_reply)
             else:
@@ -239,6 +264,12 @@ class AIService:
                         "content": system_instructions
                     }
                 ]
+
+                # Real multi-turn history for OpenAI-style chat completions
+                for turn in history:
+                    role = "assistant" if turn.get("role") == "assistant" else "user"
+                    messages.append({"role": role, "content": turn.get("content", "")})
+
                 if image_bytes:
                     base64_image = base64.b64encode(image_bytes).decode('utf-8')
                     image_url = f"data:image/jpeg;base64,{base64_image}"

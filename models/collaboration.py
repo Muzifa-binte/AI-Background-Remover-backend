@@ -58,3 +58,16 @@ class CommentOut(BaseModel):
     user_name: str
     text: str
     created_at: datetime
+
+
+class FavoriteCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=8000)
+    source: Literal["chat", "caption", "suggestion"] = "chat"
+
+
+class FavoriteOut(BaseModel):
+    favorite_id: str
+    user_id: str
+    content: str
+    source: str
+    created_at: datetime

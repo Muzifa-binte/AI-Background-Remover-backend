@@ -135,10 +135,28 @@ async def connect_db() -> None:
         # Ensure unique indexes on the users collection so concurrent
         # registrations can never produce duplicate email accounts.
         await _setup_user_indexes()
+        await _setup_conversation_indexes()
     except Exception as exc:
         _db_connected = False
         print(f"[DATABASE] MongoDB connection failed: {exc}")
         print("   Check: Atlas IP whitelist, cluster is not paused, network access.")
+
+
+async def _setup_conversation_indexes() -> None:
+    """Create indexes on the conversations collection. Safe to call repeatedly."""
+    try:
+        conversations = client[get_db_name()]["conversations"]
+        await conversations.create_index(
+            [("user_id", 1), ("conversation_id", 1)],
+            unique=True,
+            name="conversations_user_conv_unique",
+        )
+        await conversations.create_index(
+            [("user_id", 1), ("updated_at", -1)],
+            name="conversations_user_updated_at",
+        )
+    except Exception as exc:
+        print(f"[DATABASE] Could not create conversation indexes: {exc}")
 
 
 async def _setup_user_indexes() -> None:

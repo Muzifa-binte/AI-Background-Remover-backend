@@ -47,16 +47,35 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     thinking: Optional[str] = None
+    conversation_id: str
     action: Optional[dict] = None
+
+
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class ChatHistoryResponse(BaseModel):
+    conversation_id: str
+    messages: list[ChatMessage]
+
+
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    preview: str
+    message_count: int
+    updated_at: str
+
+
+class ConversationListResponse(BaseModel):
+    conversations: list[ConversationSummary]
 
 
 class DetectedObject(BaseModel):
     label: str
     box_2d: list[int]
     confidence: float
-
-
-
 
 
 class StyleTransferRecommendation(BaseModel):

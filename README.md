@@ -518,3 +518,53 @@ Tests are in `backend/tests/` (if present) or add them as `test_*.py` files.
 See [CONTRIBUTING.md](../CONTRIBUTING.md) in the parent repo for branch naming, commit format, and PR rules.
 
 Your branch always goes into this submodule repo (`AI-Background-Remover-backend`), not the parent.
+
+---
+
+## Collaboration & Sharing
+
+- **Share conversations** — export a chat conversation as PDF or plain text.
+  `POST/GET /api/chat-history`, `GET /api/export/{conversation_id}?format=pdf|text`
+- **Collaborative analysis** — multiple users can comment on the same image.
+  `POST/GET /api/collab/{image_id}/comments`
+- **AI action history** — tracks which AI suggestions were shown/applied.
+  `POST/GET /api/actions`
+- **Prompt templates** — save, list, reuse, and delete effective AI prompts.
+  `POST/GET /api/prompts`, `POST /api/prompts/{id}/use`, `DELETE /api/prompts/{id}`
+
+## Analytics & Insights
+
+- **Usage analytics** — tracks which AI features are used most.
+  `POST/GET /api/analytics/usage`
+- **Success metrics** — how often AI suggestions are applied vs. just suggested.
+  `GET /api/analytics/success`
+- **Cost tracking** — logs AI API token usage and estimated cost per feature.
+  `POST/GET /api/analytics/cost`
+- **Quality feedback** — 1–5 star rating on AI suggestions.
+  `POST /api/analytics/feedback`, `GET /api/analytics/feedback/summary`
+
+Usage and action tracking is wired automatically into the `remove_bg`, `enhance`,
+`replace_bg`, `smart_crop`, `recolor`, and `chat` routes via `services/tracking.py`,
+so no extra frontend calls are needed to collect this data.
+
+---
+
+## Persistent Chat History & Multi-Turn Memory
+
+- **Real conversation memory** — chat messages are sent to the AI as actual
+  multi-turn history (a Gemini chat session / OpenAI-style message list), not
+  a pasted text prefix, so the assistant remembers prior turns properly.
+  `POST /api/chat` now accepts an optional `conversation_id` and a JSON-encoded
+  `history` array (`[{role, content}, ...]`) in the form body.
+- **Persisted conversations** — every chat turn is saved per user in a new
+  `conversations` collection, keyed by `user_id` + `conversation_id`, so a
+  conversation survives page refreshes and reopening the widget.
+- **Restore last conversation** — `GET /api/chat/history` returns the most
+  recently updated conversation (or a specific one via `?conversation_id=`).
+- **Browse all past conversations** — `GET /api/chat/conversations` lists all
+  of a user's conversations (preview text, message count, last-updated time),
+  powering a dedicated **History tab** in the chatbot widget so users can
+  reopen any earlier conversation, not just the latest one.
+- **Clear conversation** — `DELETE /api/chat/history` clears a conversation
+  (or all of a user's conversations), wired to a "Clear conversation" button
+  in the widget header.
